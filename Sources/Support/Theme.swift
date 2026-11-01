@@ -20,7 +20,7 @@ enum Palette {
 // iOS 26+ 用系统原生 glassEffect；更低版本回退到 ultraThinMaterial + 高光描边，
 // 视觉上保持同一套「玻璃层 + 同心圆角」语言。
 
-struct GlassSurface<S: Shape>: ViewModifier {
+struct GlassSurface<S: InsettableShape>: ViewModifier {
     var shape: S
     var tint: Color?
     var interactive: Bool
@@ -65,9 +65,9 @@ struct GlassSurface<S: Shape>: ViewModifier {
 }
 
 extension View {
-    func glass<S: Shape>(_ shape: S,
-                         tint: Color? = nil,
-                         interactive: Bool = false) -> some View {
+    func glass<S: InsettableShape>(_ shape: S,
+                                   tint: Color? = nil,
+                                   interactive: Bool = false) -> some View {
         modifier(GlassSurface(shape: shape, tint: tint, interactive: interactive))
     }
 

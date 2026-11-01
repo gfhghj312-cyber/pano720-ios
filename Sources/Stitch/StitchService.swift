@@ -174,7 +174,7 @@ enum StitchService {
         // 4. 管线
         let library: MTLLibrary
         do {
-            library = try device.makeLibrary(source: shaderSource, options: nil)
+            library = try await device.makeLibrary(source: shaderSource, options: nil)
         } catch {
             throw StitchError.shader(error.localizedDescription)
         }
@@ -183,7 +183,7 @@ enum StitchService {
         }
         let pipeline: MTLComputePipelineState
         do {
-            pipeline = try device.makeComputePipelineState(function: fn)
+            pipeline = try await device.makeComputePipelineState(function: fn)
         } catch {
             throw StitchError.shader(error.localizedDescription)
         }
@@ -289,8 +289,10 @@ enum StitchService {
             if let base = raw.baseAddress {
                 outTex.getBytes(base,
                                 bytesPerRow: outW * 4,
+                                bytesPerImage: outW * 4 * outH,
                                 from: MTLRegionMake2D(0, 0, outW, outH),
-                                mipmapLevel: 0)
+                                mipmapLevel: 0,
+                                slice: 0)
             }
         }
         var holes = 0
