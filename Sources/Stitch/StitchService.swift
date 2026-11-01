@@ -219,7 +219,8 @@ enum StitchService {
                                    slice: i,
                                    mipmapLevel: 0,
                                    withBytes: base,
-                                   bytesPerRow: texW * 4)
+                                   bytesPerRow: texW * 4,
+                                   bytesPerImage: texW * 4 * texH)
                 }
             }
 
