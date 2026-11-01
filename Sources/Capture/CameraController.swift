@@ -103,24 +103,35 @@ final class CameraController: NSObject {
         isConfigured = true
     }
 
-    /// 优先选择 4:3 最大尺寸的视频格式：竖屏下水平 FOV 更宽，拍摄张数更少
-    private func applyBestFormat(on device: AVCaptureDevice) {
-        var best: AVCaptureDevice.Format?
-        var bestPixels = 0
-        for f in device.formats {
-            guard !f.videoSupportedFrameRateRanges.isEmpty else { continue }
-            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            let w = Int(d.width), h = Int(d.height)
-            guard w > 0, h > 0 else { continue }
-            let ratio = Double(max(w, h)) / Double(min(w, h))
-            guard abs(ratio - 4.0 / 3.0) < 0.04 else { continue }
-            let px = w * h
-            if px > bestPixels {
-                bestPixels = px
-                best = f
+    /// 优先选择 4:3 视频格式：竖屏下水平 FOV 更宽，拍摄张数更少。
+    /// maxEdge 用于把过高的分辨率（12MP 直出视频流）降下来，避免掉帧/发热。
+    private func applyBestFormat(on device: AVCaptureDevice, maxEdge: Int = 2400) {
+        func pick(limitEdge: Int?) -> AVCaptureDevice.Format? {
+            var best: AVCaptureDevice.Format?
+            var bestPixels = 0
+            for f in device.formats {
+                guard !f.videoSupportedFrameRateRanges.isEmpty else { continue }
+                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                let w = Int(d.width), h = Int(d.height)
+                guard w > 0, h > 0 else { continue }
+                let ratio = Double(max(w, h)) / Double(min(w, h))
+                guard abs(ratio - 4.0 / 3.0) < 0.04 else { continue }
+                if let limitEdge, max(w, h) > limitEdge { continue }
+                let px = w * h
+                if px > bestPixels {
+                    bestPixels = px
+                    best = f
+                }
             }
+            return best
         }
-        if best == nil {
+
+        var format = pick(limitEdge: maxEdge) ?? pick(limitEdge: nil)
+
+        if format == nil {
+            // 完全没有 4:3，退回最大可用格式
+            var best: AVCaptureDevice.Format?
+            var bestPixels = 0
             for f in device.formats {
                 guard !f.videoSupportedFrameRateRanges.isEmpty else { continue }
                 let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
@@ -130,8 +141,9 @@ final class CameraController: NSObject {
                     best = f
                 }
             }
+            format = best
         }
-        guard let format = best else { return }
+        guard let format else { return }
 
         do {
             try device.lockForConfiguration()
@@ -144,6 +156,7 @@ final class CameraController: NSObject {
             device.videoZoomFactor = 1.0
             if device.isLowLightBoostSupported { device.automaticallyEnablesLowLightBoostWhenAvailable = true }
             device.unlockForConfiguration()
+            computeIntrinsics(for: device)
         } catch {
             // 保持默认格式
         }
@@ -169,7 +182,27 @@ final class CameraController: NSObject {
             guard self.isConfigured, !self.session.isRunning else { return }
             self.session.startRunning()
             self.isRunning = true
+
+            // 看门狗：2.5s 内没有出图（有些机型不支持高分辨率视频流）就降档，保持 4:3 比例不变
+            self.sessionQueue.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, self.isRunning, !self.hasReceivedFrame else { return }
+                self.downgradeFormat()
+            }
         }
+    }
+
+    private var hasReceivedFrame: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestBuffer != nil
+    }
+
+    private func downgradeFormat() {
+        guard let device = session.inputs.compactMap({ ($0 as? AVCaptureDeviceInput)?.device }).first else { return }
+        session.beginConfiguration()
+        applyBestFormat(on: device, maxEdge: 2000)
+        session.commitConfiguration()
+        // 同为 4:3 裁切、同一视场角，所以 tanHalf（内参比例）保持不变，无需通知上层
     }
 
     func stop() {
