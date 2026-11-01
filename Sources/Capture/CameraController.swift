@@ -18,8 +18,73 @@ enum CameraError: LocalizedError {
     }
 }
 
-/// 采集相机视频流（而不是 PhotoOutput）：每一帧都是已知朝向的 CVPixelBuffer，
-/// 与陀螺仪姿态可以严格对齐，拼接质量更稳定。
+// MARK: - 镜头
+
+enum CameraLens: String, CaseIterable, Identifiable {
+    case ultraWide
+    case wide
+
+    var id: String { rawValue }
+
+    var shortLabel: String {
+        switch self {
+        case .ultraWide: return "0.5×"
+        case .wide: return "1×"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .ultraWide: return "超广角"
+        case .wide: return "广角"
+        }
+    }
+
+    var deviceType: AVCaptureDevice.DeviceType {
+        switch self {
+        case .ultraWide: return .builtInUltraWideCamera
+        case .wide: return .builtInWideAngleCamera
+        }
+    }
+
+    /// 送进拼接的中央比例。超广角边角分辨率骤降、残余畸变大，
+    /// 只取中间一块做球面投影，接缝会干净很多（实测 0.92 与 0.88 张数相同、0.92 更清晰）。
+    var usableCrop: Float {
+        switch self {
+        case .ultraWide: return 0.92
+        case .wide: return 1.0
+        }
+    }
+
+    /// 备用视场角（水平，传感器横向），读不到 format 时兜底
+    var fallbackHorizontalFOV: Float {
+        switch self {
+        case .ultraWide: return 100
+        case .wide: return 66
+        }
+    }
+}
+
+/// 竖屏下的相机内参（焦距已归一化）
+struct CameraIntrinsics: Equatable {
+    var tanHalfH: Float = 0.47     // 竖屏水平半视场角正切（全画幅）
+    var tanHalfV: Float = 0.63     // 竖屏垂直半视场角正切（全画幅）
+    var crop: Float = 1.0          // 参与拼接的中央比例
+
+    var tanHalfHEffective: Float { tanHalfH * crop }
+    var tanHalfVEffective: Float { tanHalfV * crop }
+    var hfovDegrees: Float { 2 * atan(tanHalfHEffective) * 180 / .pi }
+    var vfovDegrees: Float { 2 * atan(tanHalfVEffective) * 180 / .pi }
+}
+
+struct CameraFrame {
+    let buffer: CVPixelBuffer
+    let timestamp: TimeInterval    // 与 CACurrentMediaTime / CMDeviceMotion 同一时钟
+    let luma: Float
+}
+
+/// 采集相机视频流（而不是 PhotoOutput）：每一帧都是已知朝向、已知时间戳的 CVPixelBuffer，
+/// 与陀螺仪姿态可以严格对齐。
 final class CameraController: NSObject {
 
     let session = AVCaptureSession()
@@ -30,10 +95,12 @@ final class CameraController: NSObject {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     private let lock = NSLock()
-    private var latestBuffer: CVPixelBuffer?
+    private var latest: (buffer: CVPixelBuffer, timestamp: TimeInterval)?
 
+    private(set) var intrinsics = CameraIntrinsics()
+    private(set) var activeLens: CameraLens = .wide
+    private(set) var supportsUltraWide = false
     private(set) var imageSize: CGSize = .zero
-    private(set) var focalPixels: Float = 3000
     private(set) var isConfigured = false
     private(set) var isRunning = false
 
@@ -48,6 +115,12 @@ final class CameraController: NSObject {
         case .notDetermined: return await AVCaptureDevice.requestAccess(for: .video)
         default: return false
         }
+    }
+
+    private static func device(for lens: CameraLens) -> AVCaptureDevice? {
+        AVCaptureDevice.default(lens.deviceType, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(for: .video)
     }
 
     func configure() async throws {
@@ -71,17 +144,21 @@ final class CameraController: NSObject {
 
         session.sessionPreset = .photo
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                ?? AVCaptureDevice.default(for: .video) else {
+        supportsUltraWide = AVCaptureDevice.default(.builtInUltraWideCamera,
+                                                   for: .video,
+                                                   position: .back) != nil
+        // 默认用超广角：一次能覆盖 90°×106°，整圈只要十来张，拍摄速度快一个量级
+        let lens: CameraLens = supportsUltraWide ? .ultraWide : .wide
+
+        guard let device = CameraController.device(for: lens) else {
             throw CameraError.noDevice
         }
-
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else { throw CameraError.noInput }
         session.addInput(input)
+        activeLens = lens
 
         applyBestFormat(on: device)
-        computeIntrinsics(for: device)
 
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -98,13 +175,55 @@ final class CameraController: NSObject {
             conn.videoRotationAngle = CameraController.portraitRotationAngle
         }
 
-        // 旋转 90° 后缓冲区的宽高互换
-        imageSize = CGSize(width: imageSize.height, height: imageSize.width)
+        configureIntrinsics(on: device)
         isConfigured = true
     }
 
-    /// 优先选择 4:3 视频格式：竖屏下水平 FOV 更宽，拍摄张数更少。
-    /// maxEdge 用于把过高的分辨率（12MP 直出视频流）降下来，避免掉帧/发热。
+    /// 切换镜头（0.5× ⇄ 1×）。会话运行中换输入，预览层会自动跟上。
+    func setLens(_ lens: CameraLens) async throws {
+        if lens == .ultraWide && !supportsUltraWide { return }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            sessionQueue.async {
+                do {
+                    try self.applyLensLocked(lens)
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func applyLensLocked(_ lens: CameraLens) throws {
+        guard isConfigured, lens != activeLens else { return }
+        guard let device = CameraController.device(for: lens) else { throw CameraError.noDevice }
+        let newInput = try AVCaptureDeviceInput(device: device)
+
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        guard session.canAddInput(newInput) else {
+            session.commitConfiguration()
+            throw CameraError.noInput
+        }
+        session.addInput(newInput)
+        activeLens = lens
+        applyBestFormat(on: device)
+        session.commitConfiguration()
+
+        if let conn = videoOutput.connection(with: .video),
+           conn.isVideoRotationAngleSupported(CameraController.portraitRotationAngle) {
+            conn.videoRotationAngle = CameraController.portraitRotationAngle
+        }
+
+        configureIntrinsics(on: device)
+        lock.lock()
+        latest = nil
+        lock.unlock()
+    }
+
+    // MARK: - 格式与内参
+
+    /// 优先 4:3：竖屏下竖直方向的视场更宽，同样张数覆盖更多球面。
     private func applyBestFormat(on device: AVCaptureDevice, maxEdge: Int = 2400) {
         func pick(limitEdge: Int?) -> AVCaptureDevice.Format? {
             var best: AVCaptureDevice.Format?
@@ -129,7 +248,6 @@ final class CameraController: NSObject {
         var format = pick(limitEdge: maxEdge) ?? pick(limitEdge: nil)
 
         if format == nil {
-            // 完全没有 4:3，退回最大可用格式
             var best: AVCaptureDevice.Format?
             var bestPixels = 0
             for f in device.formats {
@@ -147,6 +265,11 @@ final class CameraController: NSObject {
 
         do {
             try device.lockForConfiguration()
+            // 开启镜头几何畸变校正：超广角的桶形畸变会被拍平，
+            // 否则边缘的直线弯成弧，球面投影后接缝一定会错开。
+            if device.isGeometricDistortionCorrectionSupported {
+                device.isGeometricDistortionCorrectionEnabled = true
+            }
             device.activeFormat = format
             let duration = CMTime(value: 1, timescale: 30)
             if format.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
@@ -156,23 +279,34 @@ final class CameraController: NSObject {
             device.videoZoomFactor = 1.0
             if device.isLowLightBoostSupported { device.automaticallyEnablesLowLightBoostWhenAvailable = true }
             device.unlockForConfiguration()
-            computeIntrinsics(for: device)
         } catch {
             // 保持默认格式
         }
     }
 
-    private func computeIntrinsics(for device: AVCaptureDevice) {
+    private func configureIntrinsics(on device: AVCaptureDevice) {
         let format = device.activeFormat
         let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-        imageSize = CGSize(width: CGFloat(dims.width), height: CGFloat(dims.height))
+
+        // videoFieldOfView 是「传感器横向（长边）」的水平视场角；
+        // 开了畸变校正后要以校正后的视场角为准，否则焦距会算偏，接缝会整体错位。
+        var deg = format.videoFieldOfView
+        if device.isGeometricDistortionCorrectionEnabled {
+            let corrected = format.geometricDistortionCorrectedVideoFieldOfView
+            if corrected > 5 { deg = corrected }
+        }
 
         let longEdge = Float(max(dims.width, dims.height))
+        let shortEdge = Float(min(dims.width, dims.height))
+        let fallback = activeLens.fallbackHorizontalFOV
+        let hfovDeg: Float = (deg > 12 && deg < 150) ? Float(deg) : fallback
+        let focal = (longEdge / 2) / tan(hfovDeg * .pi / 360)
 
-        // videoFieldOfView 是「长边方向」的水平视场角（传感器原生横向）
-        let deg = Float(format.videoFieldOfView)
-        let hfov: Float = (deg > 10 && deg < 140) ? deg * Float.pi / 180 : 66 * Float.pi / 180
-        focalPixels = (longEdge / 2) / tan(hfov / 2)
+        // 竖屏：长边在竖直方向
+        intrinsics = CameraIntrinsics(tanHalfH: (shortEdge / 2) / focal,
+                                      tanHalfV: (longEdge / 2) / focal,
+                                      crop: activeLens.usableCrop)
+        imageSize = CGSize(width: CGFloat(shortEdge), height: CGFloat(longEdge))
     }
 
     // MARK: - 运行
@@ -183,7 +317,7 @@ final class CameraController: NSObject {
             self.session.startRunning()
             self.isRunning = true
 
-            // 看门狗：2.5s 内没有出图（有些机型不支持高分辨率视频流）就降档，保持 4:3 比例不变
+            // 看门狗：2.5s 内没有出图（有些机型不支持高分辨率视频流）就降档
             self.sessionQueue.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                 guard let self, self.isRunning, !self.hasReceivedFrame else { return }
                 self.downgradeFormat()
@@ -194,7 +328,7 @@ final class CameraController: NSObject {
     private var hasReceivedFrame: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return latestBuffer != nil
+        return latest != nil
     }
 
     private func downgradeFormat() {
@@ -202,7 +336,7 @@ final class CameraController: NSObject {
         session.beginConfiguration()
         applyBestFormat(on: device, maxEdge: 2000)
         session.commitConfiguration()
-        // 同为 4:3 裁切、同一视场角，所以 tanHalf（内参比例）保持不变，无需通知上层
+        configureIntrinsics(on: device)
     }
 
     func stop() {
@@ -211,7 +345,7 @@ final class CameraController: NSObject {
             self.session.stopRunning()
             self.isRunning = false
             self.lock.lock()
-            self.latestBuffer = nil
+            self.latest = nil
             self.lock.unlock()
         }
     }
@@ -219,12 +353,14 @@ final class CameraController: NSObject {
     // MARK: - 取帧
 
     /// 取出最新一帧（保留引用，避免被缓冲池回收）
-    func grabFrame() -> (buffer: CVPixelBuffer, luma: Float)? {
+    func grabFrame() -> CameraFrame? {
         lock.lock()
-        let buffer = latestBuffer
+        let frame = latest
         lock.unlock()
-        guard let buffer else { return nil }
-        return (buffer, CameraController.meanLuma(of: buffer))
+        guard let frame else { return nil }
+        return CameraFrame(buffer: frame.buffer,
+                           timestamp: frame.timestamp,
+                           luma: CameraController.meanLuma(of: frame.buffer))
     }
 
     /// 把 CVPixelBuffer 编码成 JPEG（后台执行）
@@ -265,8 +401,9 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         lock.lock()
-        latestBuffer = pb
+        latest = (pb, pts)
         lock.unlock()
     }
 }

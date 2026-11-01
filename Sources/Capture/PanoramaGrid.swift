@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import simd
 
 /// 球面上的一个拍摄节点（机位）
 struct CaptureNode: Identifiable, Equatable {
@@ -20,41 +21,138 @@ struct CaptureNode: Identifiable, Equatable {
 }
 
 enum PanoramaGrid {
-    /// 依据实际相机视场角生成覆盖整个球面的机位网格。
-    /// - Parameter overlap: 相邻帧之间的重叠比例（0.28 ≈ 28%）
-    static func nodes(tanHalfH: Float, tanHalfV: Float,
-                      overlap: Float = 0.28, baseYaw: Float = 0) -> [CaptureNode] {
-        let hfov = 2 * atan(max(0.05, tanHalfH))
-        let vfov = 2 * atan(max(0.05, tanHalfV))
-        let stepH = hfov * (1 - overlap)
-        let stepV = vfov * (1 - overlap)
 
-        // 从赤道向上下依次排环
-        var pitches: [Float] = [0]
-        var p = stepV
-        while p < Float.pi / 2 - vfov * 0.22 {
-            pitches.append(p)
-            pitches.append(-p)
-            p += stepV
+    /// 依实际视场角，用「贪心球面覆盖」生成机位：
+    /// 每帧的可拍范围是视场矩形（按 overlap 缩小），不断在「离所有已有机位最远的未覆盖点」
+    /// 放新机位，直到整个球面被覆盖。
+    ///
+    /// 这样得到的机位数是接近最优的，而且**覆盖是构造保证的**——
+    /// 只要用户拍完所有机位，拼接就不可能出空洞。
+    ///
+    /// - Parameters:
+    ///   - tanHalfH: 竖屏水平半视场角正切（已乘裁切系数）
+    ///   - tanHalfV: 竖屏垂直半视场角正切（已乘裁切系数）
+    ///   - overlap: 相邻帧重叠比例，0.16 ≈ 16%（1× 约 35 张，0.5× 约 14 张）
+    ///   - baseDirection: 第一张要正对的方向
+    static func nodes(tanHalfH: Float,
+                      tanHalfV: Float,
+                      overlap: Float = 0.16,
+                      baseDirection: Vec3 = Vec3(1, 0, 0),
+                      maxNodes: Int = 72) -> [CaptureNode] {
+
+        let hH = max(0.10, tanHalfH)
+        let hV = max(0.10, tanHalfV)
+        // 视场矩形按重叠比例收缩；收缩后的矩形就是「一帧保证覆盖」的范围
+        let keep = 1 - clampf(overlap, 0, 0.55)
+        let covH = hH * keep
+        let covV = hV * keep
+
+        // 球面采样点（Fibonacci 分布）
+        let sampleCount = 5200
+        var samples = [Vec3]()
+        samples.reserveCapacity(sampleCount)
+        let golden = Float.pi * (3 - sqrt(5))
+        for i in 0..<sampleCount {
+            let z = 1 - 2 * (Float(i) + 0.5) / Float(sampleCount)
+            let r = sqrt(max(0, 1 - z * z))
+            let th = golden * Float(i)
+            samples.append(Vec3(r * cos(th), r * sin(th), z))
         }
 
-        var result: [CaptureNode] = []
-        var idx = 0
-        for pitch in pitches {
-            let cosP = max(0.12, cos(pitch))
-            // 在该纬度上，保持同样的弧长间距所需的经度步长
-            let stepYaw = 2 * asin(min(1, sin(stepH / 2) / cosP))
-            let count = max(4, Int((2 * Float.pi / max(0.0001, stepYaw)).rounded()))
-            for k in 0..<count {
-                let yaw = baseYaw + Float(k) * (2 * Float.pi / Float(count))
-                result.append(CaptureNode(id: idx, pitch: pitch, yaw: wrapAngle(yaw), kind: .ring))
-                idx += 1
+        struct Axis {
+            let forward: Vec3
+            let right: Vec3
+            let up: Vec3
+        }
+
+        func axis(_ direction: Vec3) -> Axis {
+            let f = simd_normalize(direction)
+            var hint = Vec3(0, 0, 1)
+            if abs(simd_dot(f, hint)) > 0.97 { hint = Vec3(0, 1, 0) }
+            let right = simd_normalize(simd_cross(hint, f))
+            let up = simd_cross(f, right)
+            return Axis(forward: f, right: right, up: up)
+        }
+
+        func covers(_ a: Axis, _ d: Vec3) -> Bool {
+            let cz = simd_dot(d, a.forward)
+            guard cz > 0.02 else { return false }
+            let tx = simd_dot(d, a.right) / cz
+            let ty = simd_dot(d, a.up) / cz
+            return abs(tx) <= covH && abs(ty) <= covV
+        }
+
+        var axes: [Axis] = [axis(baseDirection)]
+        var covered = [Bool](repeating: false, count: sampleCount)
+        var nearest = [Float](repeating: .pi, count: sampleCount)
+
+        func apply(_ a: Axis) {
+            for i in 0..<sampleCount {
+                let d = samples[i]
+                if !covered[i] && covers(a, d) { covered[i] = true }
+                let ang = acos(max(-1, min(1, simd_dot(d, a.forward))))
+                if ang < nearest[i] { nearest[i] = ang }
             }
         }
+        apply(axes[0])
 
-        result.append(CaptureNode(id: idx, pitch: Float.pi / 2 - 0.055, yaw: baseYaw, kind: .zenith))
-        idx += 1
-        result.append(CaptureNode(id: idx, pitch: -Float.pi / 2 + 0.055, yaw: baseYaw, kind: .nadir))
-        return result
+        while axes.count < maxNodes {
+            // 找「离已有机位最远」的未覆盖点 —— 那里就是当前最大的洞
+            var bestIndex = -1
+            var bestAngle: Float = 0.02
+            for i in 0..<sampleCount where !covered[i] {
+                if nearest[i] > bestAngle {
+                    bestAngle = nearest[i]
+                    bestIndex = i
+                }
+            }
+            guard bestIndex >= 0 else { break }
+            let newAxis = axis(samples[bestIndex])
+            axes.append(newAxis)
+            apply(newAxis)
+        }
+
+        // 归类 + 排序
+        var raw: [CaptureNode] = axes.map { a in
+            let pitch = pitchOf(a.forward)
+            let yaw = yawOf(a.forward)
+            let kind: CaptureNode.Kind
+            if pitch > 1.30 { kind = .zenith }
+            else if pitch < -1.30 { kind = .nadir }
+            else { kind = .ring }
+            return CaptureNode(id: 0, pitch: pitch, yaw: yaw, kind: kind)
+        }
+
+        // 从最接近起始朝向的机位出发，按最近邻走一圈：用户转动的总角度最小
+        let startDirection = simd_normalize(baseDirection)
+        var order: [Int] = []
+        var used = [Bool](repeating: false, count: raw.count)
+        if let first = raw.indices.min(by: {
+            angleBetween(raw[$0].direction, startDirection) < angleBetween(raw[$1].direction, startDirection)
+        }) {
+            order.append(first)
+            used[first] = true
+        }
+        while order.count < raw.count {
+            guard let last = order.last else { break }
+            let from = raw[last].direction
+            var pick = -1
+            var bestAngle: Float = .greatestFiniteMagnitude
+            for i in raw.indices where !used[i] {
+                let a = angleBetween(raw[i].direction, from)
+                if a < bestAngle {
+                    bestAngle = a
+                    pick = i
+                }
+            }
+            guard pick >= 0 else { break }
+            order.append(pick)
+            used[pick] = true
+        }
+
+        return order.enumerated().map { newID, oldIndex in
+            let n = raw[oldIndex]
+            return CaptureNode(id: newID, pitch: n.pitch, yaw: n.yaw, kind: n.kind)
+        }
     }
 }

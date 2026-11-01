@@ -7,9 +7,10 @@ import simd
 
 struct StitchInput {
     let url: URL
-    let rotation: simd_float3x3   // 设备(=相机) -> 世界
-    let tanHalfH: Float
-    let tanHalfV: Float
+    let rotation: simd_float3x3   // 相机 -> 世界
+    let tanHalfH: Float           // 全画幅 竖屏水平半视场角正切
+    let tanHalfV: Float           // 全画幅 竖屏垂直半视场角正切
+    let crop: Float               // 参与拼接的中央比例
     let luma: Float
 }
 
@@ -41,9 +42,11 @@ enum StitchError: LocalizedError {
     }
 }
 
-/// 基于姿态（陀螺仪）的球面投影拼接：
-/// 对等距圆柱目标图的每个像素求世界射线，反投影到每一张源图采样，
-/// 用边缘羽化 + 视角余弦权重做加权混合，并做亮度增益补偿。
+/// 基于姿态（陀螺仪）的球面投影拼接。
+///
+/// 对等距圆柱目标图的每个像素求世界射线 w，用每帧的旋转 R（相机→世界）算出相机系方向
+/// c = Rᵀ·w，再做针孔反投影采样。权重 = 边缘羽化 × cos³(离轴角) × 曝光增益。
+/// 第二轮对第一轮没覆盖到的像素做「放宽边界 + 钳制采样」的补洞。
 enum StitchService {
 
     // MARK: - Metal 着色器（运行时编译，免去 .metal 构建配置）
@@ -56,15 +59,21 @@ enum StitchService {
         int outW;
         int outH;
         int count;
-        float pad;
+        int pad;
     };
 
     struct Img {
-        float4 r0;
-        float4 r1;
-        float4 r2;
+        float4 r0;     // Rᵀ 的第 0 行（世界 -> 相机）
+        float4 r1;     // Rᵀ 的第 1 行
+        float4 r2;     // Rᵀ 的第 2 行
         float4 misc;   // x: tanHalfH, y: tanHalfV, z: gain, w: slice
+        float4 ext;    // x: 覆盖用 tanH, y: 覆盖用 tanV, z: 0.5*crop, w: feather 宽度
     };
+
+    // 相机看 -Z：可见点在相机系里 z < 0
+    static inline float3 toCamera(Img im, float3 w) {
+        return float3(dot(im.r0.xyz, w), dot(im.r1.xyz, w), dot(im.r2.xyz, w));
+    }
 
     kernel void stitchPano(texture2d_array<float, access::sample> src [[texture(0)]],
                            texture2d<float, access::write> dst [[texture(1)]],
@@ -81,46 +90,75 @@ enum StitchService {
         float lon = (u - 0.5) * 6.28318530718;
         float lat = (0.5 - v) * 3.14159265359;
         float cl = cos(lat);
-        float3 wdir = float3(cl * cos(lon), cl * sin(lon), sin(lat));
+        float3 w = float3(cl * cos(lon), cl * sin(lon), sin(lat));
 
         float3 acc = float3(0.0);
         float wsum = 0.0;
 
+        // 第一轮：严格落在画幅内，按到裁切边长度的距离羽化
         for (int i = 0; i < hp.count; ++i) {
             Img im = imgs[i];
-            float3 c = float3(dot(im.r0.xyz, wdir),
-                              dot(im.r1.xyz, wdir),
-                              dot(im.r2.xyz, wdir));
+            float3 c = toCamera(im, w);
             if (c.z >= -0.0001) { continue; }
+            float inv = 1.0 / (-c.z);
+            float tx = c.x * inv;
+            float ty = c.y * inv;
+            if (fabs(tx) > im.ext.x || fabs(ty) > im.ext.y) { continue; }
 
-            float iz = 1.0 / (-c.z);
-            float tx = c.x * iz;
-            float ty = c.y * iz;
             float su = 0.5 + 0.5 * tx / im.misc.x;
             float sv = 0.5 - 0.5 * ty / im.misc.y;
             if (su < 0.0 || su > 1.0 || sv < 0.0 || sv > 1.0) { continue; }
 
-            float eu = min(su, 1.0 - su);
-            float ev = min(sv, 1.0 - sv);
-            float feather = smoothstep(0.0, 0.17, eu) * smoothstep(0.0, 0.17, ev);
-            if (feather <= 0.0001) { continue; }
+            float eu = im.ext.z - fabs(su - 0.5);
+            float ev = im.ext.z - fabs(sv - 0.5);
+            if (eu <= 0.0 || ev <= 0.0) { continue; }
 
-            // 越靠近光轴权重越高，减少边缘畸变带来的错位
-            float cosA = 1.0 / sqrt(1.0 + tx * tx + ty * ty);
-            float wt = feather * cosA * cosA * cosA * im.misc.z;
+            float feather = smoothstep(0.0, im.ext.w, eu) * smoothstep(0.0, im.ext.w, ev);
+            if (feather <= 0.00001) { continue; }
+
+            float cosA2 = 1.0 / (1.0 + tx * tx + ty * ty);
+            float wt = feather * cosA2 * sqrt(cosA2) * im.misc.z;
 
             float4 col = src.sample(smp, float2(su, sv), uint(im.misc.w + 0.5));
             acc += col.rgb * wt;
             wsum += wt;
         }
 
+        // 第二轮：仍有洞就放宽边界（最多溢到画幅外 45%），做边缘外推补洞
+        if (wsum <= 0.00001) {
+            for (int i = 0; i < hp.count; ++i) {
+                Img im = imgs[i];
+                float3 c = toCamera(im, w);
+                if (c.z >= -0.0001) { continue; }
+                float inv = 1.0 / (-c.z);
+                float tx = c.x * inv;
+                float ty = c.y * inv;
+
+                float over = max(fabs(tx) / im.ext.x, fabs(ty) / im.ext.y);
+                if (over > 1.45) { continue; }
+                float k = 1.0 - (max(over, 1.0) - 1.0) / 0.45;
+                k = k * k;
+                if (k <= 0.0001) { continue; }
+
+                float su = clamp(0.5 + 0.5 * tx / im.misc.x, 0.0, 1.0);
+                float sv = clamp(0.5 - 0.5 * ty / im.misc.y, 0.0, 1.0);
+
+                float cosA2 = 1.0 / (1.0 + tx * tx + ty * ty);
+                float wt = k * cosA2 * sqrt(cosA2) * im.misc.z * 0.35;
+
+                float4 col = src.sample(smp, float2(su, sv), uint(im.misc.w + 0.5));
+                acc += col.rgb * wt;
+                wsum += wt;
+            }
+        }
+
         float3 outc;
         float filled;
-        if (wsum > 1e-5) {
-            outc = acc / max(wsum, 1e-5);
+        if (wsum > 0.00001) {
+            outc = acc / wsum;
             filled = 1.0;
         } else {
-            outc = float3(0.10, 0.11, 0.13);
+            outc = float3(0.07, 0.08, 0.10);
             filled = 0.0;
         }
         dst.write(float4(outc, filled), gid);
@@ -131,7 +169,7 @@ enum StitchService {
         var outW: Int32 = 0
         var outH: Int32 = 0
         var count: Int32 = 0
-        var pad: Float = 0
+        var pad: Int32 = 0
     }
 
     private struct ShaderImage {
@@ -139,6 +177,7 @@ enum StitchService {
         var r1 = SIMD4<Float>(0, 0, 0, 0)
         var r2 = SIMD4<Float>(0, 0, 0, 0)
         var misc = SIMD4<Float>(0, 0, 0, 0)
+        var ext = SIMD4<Float>(0, 0, 0, 0)
     }
 
     // MARK: - 入口
@@ -156,13 +195,13 @@ enum StitchService {
         let inputs = alignToFirst(rawInputs)
 
         // 2. 输出尺寸（严格 2:1）
-        let outW = max(1024, outWidth)
+        let outW = max(1024, outWidth - (outWidth % 2))
         let outH = outW / 2
 
         // 3. 源图降采样尺寸：控制显存占用
         let count = inputs.count
-        let budgetBytes = 140.0 * 1024 * 1024
-        let approxBytesPerTexel = 4.0 / 0.75   // 4:3 情况下每"最大边长"像素的字节数近似
+        let budgetBytes = 170.0 * 1024 * 1024
+        let approxBytesPerTexel = 4.0 / 0.75
         var maxDim = Int(sqrt(budgetBytes / (approxBytesPerTexel * Double(count))))
         maxDim = max(900, min(1600, maxDim))
 
@@ -208,31 +247,40 @@ enum StitchService {
 
         var params = [ShaderImage]()
         params.reserveCapacity(count)
+        var slice = 0
 
         for (i, input) in inputs.enumerated() {
-            let gain = clampf(globalLuma / lumas[i], 0.72, 1.38)
-
             guard let bytes = downsampledRGBA(url: input.url, width: texW, height: texH) else { continue }
+
+            let gain = clampf(globalLuma / lumas[i], 0.80, 1.25)
             bytes.withUnsafeBytes { raw in
                 if let base = raw.baseAddress {
                     srcTex.replace(region: MTLRegionMake2D(0, 0, texW, texH),
                                    mipmapLevel: 0,
-                                   slice: i,
+                                   slice: slice,
                                    withBytes: base,
                                    bytesPerRow: texW * 4,
                                    bytesPerImage: texW * 4 * texH)
                 }
             }
 
-            let rows = input.rotation.rows4
+            let crop = clampf(input.crop, 0.6, 1.0)
+            let tanFullH = max(0.05, input.tanHalfH)
+            let tanFullV = max(0.05, input.tanHalfV)
+
             var p = ShaderImage()
+            // 关键：传 Rᵀ 的三行（= R 的三列），着色器里才能算 c = Rᵀ·w
+            let rows = input.rotation.worldToCameraRows4
             p.r0 = rows[0]
             p.r1 = rows[1]
             p.r2 = rows[2]
-            p.misc = SIMD4<Float>(input.tanHalfH, input.tanHalfV, gain, Float(i))
+            p.misc = SIMD4<Float>(tanFullH, tanFullV, gain, Float(slice))
+            // 覆盖范围 = 中央 crop 那块；ext.z 是它在 u 方向上的半宽
+            p.ext = SIMD4<Float>(tanFullH * crop, tanFullV * crop, 0.5 * crop, 0.11)
             params.append(p)
+            slice += 1
 
-            progress(0.05 + 0.65 * Double(i + 1) / Double(count))
+            progress(0.05 + 0.6 * Double(i + 1) / Double(count))
         }
 
         guard !params.isEmpty else { throw StitchError.noInput }
@@ -264,11 +312,15 @@ enum StitchService {
         header.outH = Int32(outH)
         header.count = Int32(params.count)
         encoder.setBytes(&header, length: MemoryLayout<Header>.stride, index: 0)
-        params.withUnsafeBytes { raw in
-            if let base = raw.baseAddress {
-                encoder.setBytes(base, length: MemoryLayout<ShaderImage>.stride * params.count, index: 1)
-            }
+
+        // 参数表用 buffer 而不是 setBytes：setBytes 有 4KB 上限，机位多时会超
+        let paramLength = MemoryLayout<ShaderImage>.stride * params.count
+        let paramBuffer: MTLBuffer? = params.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return nil }
+            return device.makeBuffer(bytes: base, length: paramLength, options: .storageModeShared)
         }
+        guard let paramBuffer else { throw StitchError.texture("参数缓冲分配失败") }
+        encoder.setBuffer(paramBuffer, offset: 0, index: 1)
 
         let tw = pipeline.threadExecutionWidth
         let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
@@ -347,13 +399,13 @@ enum StitchService {
     private static func alignToFirst(_ inputs: [StitchInput]) -> [StitchInput] {
         guard let first = inputs.first else { return inputs }
         let f = first.rotation.cameraForward
-        let yaw0 = yawOf(f)
-        let a = rotationZ(-yaw0)
+        let a = rotationZ(-yawOf(f))
         return inputs.map { input in
             StitchInput(url: input.url,
                         rotation: simd_mul(a, input.rotation),
                         tanHalfH: input.tanHalfH,
                         tanHalfV: input.tanHalfV,
+                        crop: input.crop,
                         luma: input.luma)
         }
     }

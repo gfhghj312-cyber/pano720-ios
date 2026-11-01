@@ -59,6 +59,22 @@ extension simd_float3x3 {
             SIMD4<Float>(t.columns.2, 0)
         ]
     }
+
+    /// 转置后的三行 = 原矩阵的三列。
+    /// self 是「设备(相机) -> 世界」，着色器里要用「世界 -> 相机」，
+    /// 即 c = Rᵀ·w，所以向下传的必须是这个，而不是 rows4。
+    var worldToCameraRows4: [SIMD4<Float>] {
+        [
+            SIMD4<Float>(columns.0, 0),
+            SIMD4<Float>(columns.1, 0),
+            SIMD4<Float>(columns.2, 0)
+        ]
+    }
+
+    /// 世界方向 -> 相机坐标系（相机沿 -Z 看）
+    func cameraSpace(_ world: Vec3) -> Vec3 {
+        transpose * world
+    }
 }
 
 /// 绕 Z 轴旋转

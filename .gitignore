@@ -21,3 +21,5 @@ xcuserdata/
 
 # local build output
 dist/
+dist_check_*.png
+__pycache__/

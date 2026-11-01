@@ -11,7 +11,8 @@ final class CaptureModel {
     struct Shot: Identifiable {
         let id = UUID()
         let fileName: String
-        let rotation: simd_float3x3
+        let rotation: simd_float3x3     // 相机 -> 世界（按该帧时间戳插值得到）
+        let intrinsics: CameraIntrinsics
         let luma: Float
         let nodeID: Int?
         let thumbnail: UIImage?
@@ -42,8 +43,8 @@ final class CaptureModel {
     private(set) var lastThumbnail: UIImage?
     private(set) var stitchProgress: Double = 0
     private(set) var imageAspect: CGFloat = 0.75
-    var tanHalfH: Float = 0.47
-    var tanHalfV: Float = 0.63
+    private(set) var lens: CameraLens = .wide
+    private(set) var isSwitchingLens = false
 
     let camera = CameraController()
     private let motion = MotionService()
@@ -55,6 +56,15 @@ final class CaptureModel {
     private let haptic = UIImpactFeedbackGenerator(style: .rigid)
 
     // MARK: - 派生量
+
+    /// 取景器/引导用：全画幅半视场角正切（不含裁切）
+    var tanHalfH: Float { camera.intrinsics.tanHalfH }
+    var tanHalfV: Float { camera.intrinsics.tanHalfV }
+    var supportsUltraWide: Bool { camera.supportsUltraWide }
+    var fovText: String {
+        let i = camera.intrinsics
+        return "\(Int(i.hfovDegrees.rounded()))°×\(Int(i.vfovDegrees.rounded()))°"
+    }
 
     var capturedCount: Int { nodes.filter(\.captured).count }
 
@@ -93,6 +103,7 @@ final class CaptureModel {
         case .failed(let m): return m
         case .finished: return "完成"
         case .ready:
+            if isSwitchingLens { return "正在切换镜头…" }
             if targetNode == nil { return "全部拍完，点「拼接」生成全景" }
             if !isSteady { return "端稳手机，慢慢移动" }
             if isAligned { return "保持不动，正在自动拍摄" }
@@ -113,12 +124,8 @@ final class CaptureModel {
             do {
                 try await camera.configure()
                 camera.start()
-                let size = camera.imageSize
-                if size.width > 0 {
-                    imageAspect = size.width / size.height
-                    tanHalfH = Float(size.width) / 2 / camera.focalPixels
-                    tanHalfV = Float(size.height) / 2 / camera.focalPixels
-                }
+                lens = camera.activeLens
+                applyCameraGeometry()
                 prepareSessionDirectory()
                 motion.onSample = { [weak self] sample in
                     self?.handle(sample)
@@ -144,6 +151,35 @@ final class CaptureModel {
         isAutoCaptureEnabled.toggle()
     }
 
+    /// 切换 0.5× / 1×：视场角变了，机位网格必须重算，已拍的帧也要清掉
+    /// （同一张全景里混用两种焦距会让重叠区域的尺度对不上）
+    func switchLens(_ newLens: CameraLens) {
+        guard newLens != lens, !isSwitchingLens else { return }
+        guard newLens != .ultraWide || camera.supportsUltraWide else { return }
+        isSwitchingLens = true
+        clearShots()
+        Task { @MainActor in
+            do {
+                try await camera.setLens(newLens)
+                lens = newLens
+                applyCameraGeometry()
+                rebuildGrid()
+                isSwitchingLens = false
+                phase = .ready
+            } catch {
+                isSwitchingLens = false
+                phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func applyCameraGeometry() {
+        let size = camera.imageSize
+        if size.width > 0, size.height > 0 {
+            imageAspect = size.width / size.height
+        }
+    }
+
     // MARK: - 姿态处理
 
     private func handle(_ sample: MotionSample) {
@@ -151,10 +187,7 @@ final class CaptureModel {
         currentForward = sample.forward
 
         if nodes.isEmpty {
-            // 首次姿态决定网格的起始方位，让 0 号机位正对用户前方
-            nodes = PanoramaGrid.nodes(tanHalfH: tanHalfH,
-                                       tanHalfV: tanHalfV,
-                                       baseYaw: yawOf(sample.forward))
+            rebuildGrid(forward: sample.forward)
         }
 
         history.append((sample.timestamp, sample.forward))
@@ -162,7 +195,7 @@ final class CaptureModel {
             history.removeFirst()
         }
 
-        // 0.4 秒内光轴抖动小于 0.9° 视为稳定
+        // 0.4 秒内光轴抖动小于约 0.9° 视为稳定
         var steady = history.count >= 6
         if steady {
             for item in history where angleBetween(item.1, sample.forward) > 0.016 {
@@ -172,7 +205,7 @@ final class CaptureModel {
         }
         isSteady = steady
 
-        guard case .ready = phase else { return }
+        guard case .ready = phase, !isSwitchingLens else { return }
 
         // 目标机位 = 最近的未拍摄节点
         guard let nextTarget = nearestPendingNode() else {
@@ -186,9 +219,20 @@ final class CaptureModel {
         alignmentDeg = rad2deg(err)
         isAligned = alignmentDeg < 2.2
 
-        if isAutoCaptureEnabled, isAligned, isSteady, sample.timestamp - lastShotTime > 0.65 {
+        if isAutoCaptureEnabled, isAligned, isSteady, sample.timestamp - lastShotTime > 0.55 {
             triggerCapture(nodeID: nextTarget.id)
         }
+    }
+
+    private func rebuildGrid(forward: Vec3? = nil) {
+        let base = forward ?? currentForward
+        let intrinsics = camera.intrinsics
+        nodes = PanoramaGrid.nodes(tanHalfH: intrinsics.tanHalfHEffective,
+                                   tanHalfV: intrinsics.tanHalfVEffective,
+                                   overlap: 0.16,
+                                   baseDirection: base)
+        targetID = nil
+        alignmentDeg = 180
     }
 
     private func nearestPendingNode() -> CaptureNode? {
@@ -208,19 +252,22 @@ final class CaptureModel {
 
     /// 手动快门：对准了就按当前机位记录，没对准也允许拍（像素仍然有用）
     func manualCapture() {
-        guard case .ready = phase else { return }
+        guard case .ready = phase, !isSwitchingLens else { return }
         let nodeID: Int? = (alignmentDeg < 12) ? targetID : nil
         triggerCapture(nodeID: nodeID)
     }
 
     private func triggerCapture(nodeID: Int?) {
-        guard case .ready = phase else { return }
+        guard case .ready = phase, !isSwitchingLens else { return }
         guard let frame = camera.grabFrame() else { return }
 
         phase = .capturing
         lastShotTime = CACurrentMediaTime()
 
-        let rotation = currentRotation
+        // 按「这一帧的出图时间」取姿态：视频流有约 1~2 帧的缓冲，
+        // 直接拿当前陀螺仪读数会在转动的瞬间差出 1~3°，接缝就错开了。
+        let rotation = motion.rotation(at: frame.timestamp) ?? currentRotation
+        let intrinsics = camera.intrinsics
         let index = shots.count
         let dir = sessionDir
         let buffer = frame.buffer
@@ -246,7 +293,8 @@ final class CaptureModel {
             }
             DispatchQueue.main.async {
                 if let name {
-                    self.shots.append(Shot(fileName: name, rotation: rotation, luma: luma,
+                    self.shots.append(Shot(fileName: name, rotation: rotation,
+                                           intrinsics: intrinsics, luma: luma,
                                            nodeID: nodeID, thumbnail: thumb))
                     if let nodeID, let i = self.nodes.firstIndex(where: { $0.id == nodeID }) {
                         self.nodes[i].captured = true
@@ -270,6 +318,18 @@ final class CaptureModel {
         lastShotTime = 0
     }
 
+    private func clearShots() {
+        shots.removeAll()
+        lastThumbnail = nil
+        lastShotTime = 0
+        nodes = []
+        targetID = nil
+        if let dir = sessionDir {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        prepareSessionDirectory()
+    }
+
     // MARK: - 拼接
 
     @MainActor
@@ -281,8 +341,9 @@ final class CaptureModel {
         let inputs = shots.map { shot in
             StitchInput(url: dir.appendingPathComponent(shot.fileName),
                         rotation: shot.rotation,
-                        tanHalfH: tanHalfH,
-                        tanHalfV: tanHalfV,
+                        tanHalfH: shot.intrinsics.tanHalfH,
+                        tanHalfV: shot.intrinsics.tanHalfV,
+                        crop: shot.intrinsics.crop,
                         luma: shot.luma)
         }
 

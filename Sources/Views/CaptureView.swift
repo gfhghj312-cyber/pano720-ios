@@ -145,6 +145,11 @@ struct CaptureView: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
             .padding(.horizontal, 10)
+            .overlay(alignment: .topLeading) {
+                lensPill
+                    .padding(.leading, 20)
+                    .padding(.top, 14)
+            }
             .overlay(alignment: .bottomTrailing) {
                 if let thumb = model.lastThumbnail {
                     Image(uiImage: thumb)
@@ -161,6 +166,33 @@ struct CaptureView: View {
                         .transition(.scale.combined(with: .opacity))
                 }
             }
+    }
+
+    private var lensPill: some View {
+        HStack(spacing: 2) {
+            ForEach(CameraLens.allCases) { item in
+                let enabled = item != .ultraWide || model.supportsUltraWide
+                Button {
+                    model.switchLens(item)
+                } label: {
+                    Text(item.shortLabel)
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(model.lens == item ? Color.black : Color.white.opacity(0.82))
+                        .frame(width: 40, height: 30)
+                        .background {
+                            if model.lens == item {
+                                Capsule().fill(.white)
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+                .disabled(!enabled)
+                .opacity(enabled ? 1 : 0.28)
+            }
+        }
+        .padding(3)
+        .glass(Capsule())
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: model.lens)
     }
 
     private var hintPill: some View {
