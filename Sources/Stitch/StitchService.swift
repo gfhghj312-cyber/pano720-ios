@@ -216,8 +216,8 @@ enum StitchService {
             bytes.withUnsafeBytes { raw in
                 if let base = raw.baseAddress {
                     srcTex.replace(region: MTLRegionMake2D(0, 0, texW, texH),
-                                   slice: i,
                                    mipmapLevel: 0,
+                                   slice: i,
                                    withBytes: base,
                                    bytesPerRow: texW * 4,
                                    bytesPerImage: texW * 4 * texH)
