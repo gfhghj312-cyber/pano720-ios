@@ -266,7 +266,13 @@ final class CaptureModel {
 
         // 按「这一帧的出图时间」取姿态：视频流有约 1~2 帧的缓冲，
         // 直接拿当前陀螺仪读数会在转动的瞬间差出 1~3°，接缝就错开了。
-        let rotation = motion.rotation(at: frame.timestamp) ?? currentRotation
+        // 若两个时间轴不同源（偏差过大），退回当前姿态，绝不拿旧姿态顶替。
+        let now = CACurrentMediaTime()
+        var rotation = currentRotation
+        if abs(now - frame.timestamp) < 0.25,
+           let matched = motion.rotation(at: frame.timestamp) {
+            rotation = matched
+        }
         let intrinsics = camera.intrinsics
         let index = shots.count
         let dir = sessionDir
