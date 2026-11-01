@@ -79,6 +79,13 @@ enum PanoramaGrid {
             guard cz > 0.02 else { return false }
             let tx = simd_dot(d, a.right) / cz
             let ty = simd_dot(d, a.up) / cz
+
+            // 正对天顶/天底时机身滚转角是不确定的（用户怎么举都有可能），
+            // 这里按旋转不变的圆判定，代价是多覆盖一点，张数不变。
+            if abs(a.forward.z) > 0.93 {
+                let r = min(covH, covV)
+                return tx * tx + ty * ty <= r * r
+            }
             return abs(tx) <= covH && abs(ty) <= covV
         }
 
