@@ -142,13 +142,16 @@ final class CameraController: NSObject {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
-        session.sessionPreset = .photo
+        // inputPriority：由我们自己指定 activeFormat。
+        // 用 .photo/.high 这类预设时，commitConfiguration 会把 activeFormat 重置成预设选的格式，
+        // 焦距标定跟着变 —— 这是接缝对不上的一个隐性来源。
+        session.sessionPreset = .inputPriority
 
         supportsUltraWide = AVCaptureDevice.default(.builtInUltraWideCamera,
                                                    for: .video,
                                                    position: .back) != nil
-        // 默认用超广角：一次能覆盖 90°×106°，整圈只要十来张，拍摄速度快一个量级
-        let lens: CameraLens = supportsUltraWide ? .ultraWide : .wide
+        // 默认 1×：同样张数下角分辨率高 2.4 倍，成片明显更清晰
+        let lens: CameraLens = .wide
 
         guard let device = CameraController.device(for: lens) else {
             throw CameraError.noDevice
@@ -179,9 +182,12 @@ final class CameraController: NSObject {
         isConfigured = true
     }
 
-    /// 切换镜头（0.5× ⇄ 1×）。会话运行中换输入，预览层会自动跟上。
+    /// 切换镜头（0.5× ⇄ 1×）。
+    ///
+    /// 运行中的会话直接换 input，在某些机型上会静默失败：会话还在跑，但预览和出图都停在旧设备上，
+    /// 用户看到的就是「点了没反应」。所以先停会话、换输入、设格式，再重启；失败就回滚到旧镜头。
     func setLens(_ lens: CameraLens) async throws {
-        if lens == .ultraWide && !supportsUltraWide { return }
+        if lens == .ultraWide && !supportsUltraWide { throw CameraError.noDevice }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             sessionQueue.async {
                 do {
@@ -195,30 +201,79 @@ final class CameraController: NSObject {
     }
 
     private func applyLensLocked(_ lens: CameraLens) throws {
-        guard isConfigured, lens != activeLens else { return }
+        guard isConfigured else { throw CameraError.configurationFailed("相机未就绪") }
+        guard lens != activeLens else { return }
+        let previous = activeLens
+
         guard let device = CameraController.device(for: lens) else { throw CameraError.noDevice }
         let newInput = try AVCaptureDeviceInput(device: device)
 
+        let wasRunning = session.isRunning
+        if wasRunning { session.stopRunning() }
+
         session.beginConfiguration()
-        for input in session.inputs { session.removeInput(input) }
+        let oldInputs = session.inputs
+        for input in oldInputs { session.removeInput(input) }
         guard session.canAddInput(newInput) else {
+            // 回滚
+            for input in oldInputs { session.addInput(input) }
             session.commitConfiguration()
+            if wasRunning { session.startRunning() }
             throw CameraError.noInput
         }
         session.addInput(newInput)
-        activeLens = lens
-        applyBestFormat(on: device)
         session.commitConfiguration()
 
+        // 格式在 commit 之后设：inputPriority 下不会被预设覆盖
+        applyBestFormat(on: device)
         if let conn = videoOutput.connection(with: .video),
            conn.isVideoRotationAngleSupported(CameraController.portraitRotationAngle) {
             conn.videoRotationAngle = CameraController.portraitRotationAngle
         }
 
+        activeLens = lens
         configureIntrinsics(on: device)
+
         lock.lock()
         latest = nil
         lock.unlock()
+
+        if wasRunning { session.startRunning() }
+
+        // 出图看门狗：换完镜头 1.6s 还没新帧，说明这台机器不支持这种换法，退回旧镜头
+        if wasRunning, !waitForFreshFrame(timeout: 1.6) {
+            session.stopRunning()
+            session.beginConfiguration()
+            for input in session.inputs { session.removeInput(input) }
+            if let old = oldInputs.first, session.canAddInput(old) {
+                session.addInput(old)
+            } else if let fallback = CameraController.device(for: previous),
+                      let input = try? AVCaptureDeviceInput(device: fallback),
+                      session.canAddInput(input) {
+                session.addInput(input)
+            }
+            session.commitConfiguration()
+            if let d = session.inputs.compactMap({ ($0 as? AVCaptureDeviceInput)?.device }).first {
+                applyBestFormat(on: d)
+                configureIntrinsics(on: d)
+            }
+            activeLens = previous
+            session.startRunning()
+            throw CameraError.configurationFailed("这台设备无法切换到\(lens.title)，已保持\(previous.title)")
+        }
+    }
+
+    /// 阻塞等待一帧新画面（在 sessionQueue 上调用）
+    private func waitForFreshFrame(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            lock.lock()
+            let has = latest != nil
+            lock.unlock()
+            if has { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return false
     }
 
     // MARK: - 格式与内参
@@ -265,12 +320,13 @@ final class CameraController: NSObject {
 
         do {
             try device.lockForConfiguration()
-            // 开启镜头几何畸变校正：超广角的桶形畸变会被拍平，
-            // 否则边缘的直线弯成弧，球面投影后接缝一定会错开。
+            device.activeFormat = format
+            // 畸变校正要在 activeFormat 之后打开：它是按格式生效的，
+            // 先开再改格式在部分机型上会被重置掉。超广角的桶形畸变不校正，
+            // 边缘的直线就是弯的，球面投影后接缝必然错开。
             if device.isGeometricDistortionCorrectionSupported {
                 device.isGeometricDistortionCorrectionEnabled = true
             }
-            device.activeFormat = format
             let duration = CMTime(value: 1, timescale: 30)
             if format.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
                 device.activeVideoMinFrameDuration = duration

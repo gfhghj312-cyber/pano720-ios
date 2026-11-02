@@ -22,6 +22,9 @@ struct StitchedPanorama {
     let seconds: TimeInterval
     let width: Int
     let height: Int
+    /// 精配准后的残余姿态残差（度），越小说明重叠区对得越准
+    let residualDeg: Double
+    let pairCount: Int
 }
 
 enum StitchError: LocalizedError {
@@ -42,11 +45,12 @@ enum StitchError: LocalizedError {
     }
 }
 
-/// 基于姿态（陀螺仪）的球面投影拼接。
+/// 基于姿态（陀螺仪）+ 光度精配准的球面投影拼接。
 ///
-/// 对等距圆柱目标图的每个像素求世界射线 w，用每帧的旋转 R（相机→世界）算出相机系方向
-/// c = Rᵀ·w，再做针孔反投影采样。权重 = 边缘羽化 × cos³(离轴角) × 曝光增益。
-/// 第二轮对第一轮没覆盖到的像素做「放宽边界 + 钳制采样」的补洞。
+/// 1. `FrameAligner` 用重叠区光度误差修正每帧姿态（陀螺仪漂移会让接缝出现双重边缘）。
+/// 2. 对等距圆柱目标图的每个像素求世界射线 w，用每帧旋转算出相机系 c = Rᵀ·w，
+///    做针孔反投影采样，权重 = 边缘羽化 × cos³(离轴角) × 逐帧增益。
+/// 3. 第二轮对没覆盖到的像素做「放宽边界 + 钳制采样」的补洞。
 enum StitchService {
 
     // MARK: - Metal 着色器（运行时编译，免去 .metal 构建配置）
@@ -116,8 +120,9 @@ enum StitchService {
             float feather = smoothstep(0.0, im.ext.w, eu) * smoothstep(0.0, im.ext.w, ev);
             if (feather <= 0.00001) { continue; }
 
+            // 平方一下：过渡带更集中，接缝更"窄"，不会把两帧的轻微错位摊成大片半透明重影
             float cosA2 = 1.0 / (1.0 + tx * tx + ty * ty);
-            float wt = feather * cosA2 * sqrt(cosA2) * im.misc.z;
+            float wt = feather * feather * cosA2 * sqrt(cosA2) * im.misc.z;
 
             float4 col = src.sample(smp, float2(su, sv), uint(im.misc.w + 0.5));
             acc += col.rgb * wt;
@@ -180,37 +185,21 @@ enum StitchService {
         var ext = SIMD4<Float>(0, 0, 0, 0)
     }
 
+    /// 接缝羽化宽度（占画幅比例）。配准准了以后可以收窄，
+    //    从 0.11 收到 0.07：过渡带窄了 1.6 倍，重影面积同比例缩小。
+    private static let featherWidth: Float = 0.07
+
     // MARK: - 入口
 
     static func stitch(inputs rawInputs: [StitchInput],
                        outWidth: Int = 4096,
                        progress: @escaping (Double) -> Void) async throws -> StitchedPanorama {
 
-        guard !rawInputs.isEmpty else { throw StitchError.noInput }
+        guard rawInputs.count >= 1 else { throw StitchError.noInput }
         guard let device = MTLCreateSystemDefaultDevice() else { throw StitchError.noDevice }
 
-        let start = Date()
-
-        // 1. 让第一张的位置落在等距圆柱图的中心（经度 0），接缝留在正后方
-        let inputs = alignToFirst(rawInputs)
-
-        // 2. 输出尺寸（严格 2:1）
-        let outW = max(1024, outWidth - (outWidth % 2))
-        let outH = outW / 2
-
-        // 3. 源图降采样尺寸：控制显存占用
-        let count = inputs.count
-        let budgetBytes = 170.0 * 1024 * 1024
-        let approxBytesPerTexel = 4.0 / 0.75
-        var maxDim = Int(sqrt(budgetBytes / (approxBytesPerTexel * Double(count))))
-        maxDim = max(900, min(1600, maxDim))
-
-        let firstSize = imagePixelSize(of: inputs[0].url)
-        let aspect = firstSize.width > 0 ? firstSize.height / firstSize.width : 4.0 / 3.0
-        let texW = maxDim
-        let texH = max(2, Int((Double(maxDim) * Double(aspect)).rounded()))
-
-        // 4. 管线
+        // 着色器只能在 async 上下文编译；后面的重活全部丢到后台线程，
+        // 否则拼一张 4096×2048 会把主线程卡住，进度条也不动。
         let library: MTLLibrary
         do {
             library = try await device.makeLibrary(source: shaderSource, options: nil)
@@ -227,6 +216,92 @@ enum StitchService {
             throw StitchError.shader(error.localizedDescription)
         }
 
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let out = try stitchSync(inputs: rawInputs,
+                                             outWidth: outWidth,
+                                             device: device,
+                                             pipeline: pipeline,
+                                             progress: progress)
+                    cont.resume(returning: out)
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    // MARK: - 主流程（后台线程）
+
+    private static func stitchSync(inputs rawInputs: [StitchInput],
+                                   outWidth: Int,
+                                   device: MTLDevice,
+                                   pipeline: MTLComputePipelineState,
+                                   progress: @escaping (Double) -> Void) throws -> StitchedPanorama {
+
+        let start = Date()
+
+        // 1. 让第一张的位置落在等距圆柱图的中心（经度 0）
+        let aligned = alignToFirst(rawInputs)
+        guard !aligned.isEmpty else { throw StitchError.noInput }
+
+        // 2. 光度精配准：修掉陀螺仪漂移，顺便解出逐帧增益与焦距偏差
+        progress(0.04)
+        var rotations = aligned.map(\.rotation)
+        var gains = aligned.map { _ in Float(1) }
+        var tans = aligned.map { (h: $0.tanHalfH, v: $0.tanHalfV) }
+        var residualDeg: Double = 0
+        var pairCount = 0
+
+        if aligned.count >= 3 {
+            var frames: [FrameAligner.Frame] = []
+            frames.reserveCapacity(aligned.count)
+            for input in aligned {
+                guard let pyr = FrameAligner.pyramid(url: input.url) else { continue }
+                frames.append(FrameAligner.Frame(rotation: input.rotation,
+                                                 tanH: input.tanHalfH,
+                                                 tanV: input.tanHalfV,
+                                                 crop: input.crop,
+                                                 pyramid: pyr))
+            }
+            if frames.count == aligned.count {
+                let result = FrameAligner.refine(frames: frames, rounds: 4) { p in
+                    progress(0.06 + 0.40 * p)
+                }
+                if let result {
+                    rotations = result.rotations
+                    gains = result.gains
+                    residualDeg = Double(result.residualDeg)
+                    pairCount = result.pairs
+                    if abs(result.focalScale - 1) > 0.001 {
+                        for k in 0..<tans.count {
+                            tans[k].h = aligned[k].tanHalfH * result.focalScale
+                            tans[k].v = aligned[k].tanHalfV * result.focalScale
+                        }
+                    }
+                }
+            }
+        }
+
+        progress(0.48)
+
+        // 3. 输出尺寸（严格 2:1）
+        let outW = max(1024, outWidth - (outWidth % 2))
+        let outH = outW / 2
+
+        // 4. 源图降采样尺寸：控制显存占用
+        let count = aligned.count
+        let budgetBytes = 170.0 * 1024 * 1024
+        let approxBytesPerTexel = 4.0 / 0.75
+        var maxDim = Int(sqrt(budgetBytes / (approxBytesPerTexel * Double(count))))
+        maxDim = max(900, min(1600, maxDim))
+
+        let firstSize = imagePixelSize(of: aligned[0].url)
+        let aspect = firstSize.width > 0 ? firstSize.height / firstSize.width : 4.0 / 3.0
+        let texW = maxDim
+        let texH = max(2, Int((Double(maxDim) * Double(aspect)).rounded()))
+
         // 5. 纹理数组
         let desc = MTLTextureDescriptor()
         desc.textureType = .type2DArray
@@ -241,18 +316,14 @@ enum StitchService {
             throw StitchError.texture("源纹理分配失败（\(texW)x\(texH)x\(count)）")
         }
 
-        // 6. 亮度增益（全局均值回归，抑制自动曝光跳变）
-        let lumas = inputs.map { max(0.02, $0.luma) }
-        let globalLuma = lumas.reduce(0, +) / Float(lumas.count)
-
+        // 6. 参数表
         var params = [ShaderImage]()
         params.reserveCapacity(count)
         var slice = 0
 
-        for (i, input) in inputs.enumerated() {
+        for (i, input) in aligned.enumerated() {
             guard let bytes = downsampledRGBA(url: input.url, width: texW, height: texH) else { continue }
 
-            let gain = clampf(globalLuma / lumas[i], 0.80, 1.25)
             bytes.withUnsafeBytes { raw in
                 if let base = raw.baseAddress {
                     srcTex.replace(region: MTLRegionMake2D(0, 0, texW, texH),
@@ -265,22 +336,20 @@ enum StitchService {
             }
 
             let crop = clampf(input.crop, 0.6, 1.0)
-            let tanFullH = max(0.05, input.tanHalfH)
-            let tanFullV = max(0.05, input.tanHalfV)
+            let tanFullH = max(0.05, tans[i].h)
+            let tanFullV = max(0.05, tans[i].v)
 
             var p = ShaderImage()
-            // 关键：传 Rᵀ 的三行（= R 的三列），着色器里才能算 c = Rᵀ·w
-            let rows = input.rotation.worldToCameraRows4
+            let rows = rotations[i].worldToCameraRows4
             p.r0 = rows[0]
             p.r1 = rows[1]
             p.r2 = rows[2]
-            p.misc = SIMD4<Float>(tanFullH, tanFullV, gain, Float(slice))
-            // 覆盖范围 = 中央 crop 那块；ext.z 是它在 u 方向上的半宽
-            p.ext = SIMD4<Float>(tanFullH * crop, tanFullV * crop, 0.5 * crop, 0.11)
+            p.misc = SIMD4<Float>(tanFullH, tanFullV, gains[i], Float(slice))
+            p.ext = SIMD4<Float>(tanFullH * crop, tanFullV * crop, 0.5 * crop, featherWidth)
             params.append(p)
             slice += 1
 
-            progress(0.05 + 0.6 * Double(i + 1) / Double(count))
+            progress(0.48 + 0.34 * Double(i + 1) / Double(count))
         }
 
         guard !params.isEmpty else { throw StitchError.noInput }
@@ -334,7 +403,7 @@ enum StitchService {
             throw StitchError.texture(err.localizedDescription)
         }
 
-        progress(0.85)
+        progress(0.86)
 
         // 9. 读回并统计空洞
         var bytes = [UInt8](repeating: 0, count: outW * outH * 4)
@@ -390,7 +459,9 @@ enum StitchService {
                                 coverage: coverage,
                                 seconds: Date().timeIntervalSince(start),
                                 width: outW,
-                                height: outH)
+                                height: outH,
+                                residualDeg: residualDeg,
+                                pairCount: pairCount)
     }
 
     // MARK: - 辅助

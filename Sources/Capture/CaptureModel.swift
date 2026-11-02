@@ -45,6 +45,8 @@ final class CaptureModel {
     private(set) var imageAspect: CGFloat = 0.75
     private(set) var lens: CameraLens = .wide
     private(set) var isSwitchingLens = false
+    private(set) var notice: String?
+    private var noticeTask: Task<Void, Never>?
 
     let camera = CameraController()
     private let motion = MotionService()
@@ -155,21 +157,38 @@ final class CaptureModel {
     /// （同一张全景里混用两种焦距会让重叠区域的尺度对不上）
     func switchLens(_ newLens: CameraLens) {
         guard newLens != lens, !isSwitchingLens else { return }
-        guard newLens != .ultraWide || camera.supportsUltraWide else { return }
+        guard newLens != .ultraWide || camera.supportsUltraWide else {
+            showNotice("这台设备没有超广角镜头")
+            return
+        }
         isSwitchingLens = true
+        lens = newLens          // 立刻反馈，避免"点了没反应"的错觉
         clearShots()
         Task { @MainActor in
+            defer { isSwitchingLens = false }
             do {
                 try await camera.setLens(newLens)
-                lens = newLens
+                lens = camera.activeLens
                 applyCameraGeometry()
                 rebuildGrid()
-                isSwitchingLens = false
                 phase = .ready
             } catch {
-                isSwitchingLens = false
-                phase = .failed(error.localizedDescription)
+                lens = camera.activeLens
+                applyCameraGeometry()
+                rebuildGrid()
+                phase = .ready
+                showNotice(error.localizedDescription)
             }
+        }
+    }
+
+    /// 顶部短暂提示（不打断拍摄）
+    func showNotice(_ text: String) {
+        notice = text
+        noticeTask?.cancel()
+        noticeTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_200_000_000)
+            if !Task.isCancelled { self.notice = nil }
         }
     }
 

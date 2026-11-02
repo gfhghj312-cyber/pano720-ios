@@ -178,12 +178,13 @@ struct CaptureView: View {
                     Text(item.shortLabel)
                         .font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundStyle(model.lens == item ? Color.black : Color.white.opacity(0.82))
-                        .frame(width: 40, height: 30)
+                        .frame(width: 44, height: 34)
                         .background {
                             if model.lens == item {
                                 Capsule().fill(.white)
                             }
                         }
+                        .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .disabled(!enabled)
@@ -193,17 +194,26 @@ struct CaptureView: View {
         .padding(3)
         .glass(Capsule())
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: model.lens)
+        .overlay(alignment: .bottomLeading) {
+            if model.isSwitchingLens {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.white)
+                    .offset(x: 6, y: -6)
+            }
+        }
     }
 
     private var hintPill: some View {
-        Text(model.hintText)
+        Text(model.notice ?? model.hintText)
             .font(.system(size: 13, weight: .medium, design: .rounded))
-            .foregroundStyle(hintColor)
+            .foregroundStyle(model.notice != nil ? Palette.amber : hintColor)
             .multilineTextAlignment(.center)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .glass(Capsule())
             .animation(.easeInOut(duration: 0.2), value: model.hintText)
+            .animation(.easeInOut(duration: 0.2), value: model.notice)
     }
 
     private var hintColor: Color {
