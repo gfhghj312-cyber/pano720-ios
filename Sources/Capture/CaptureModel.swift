@@ -128,6 +128,15 @@ final class CaptureModel {
                 camera.start()
                 lens = camera.activeLens
                 applyCameraGeometry()
+
+                // 首帧到达后相机会用真实缓冲区尺寸修正内参（可能横竖变了）。
+                // 视场角变了机位网格就必须重算，否则引导位置和实际画幅对不上。
+                camera.onIntrinsicsChange = { [weak self] _ in
+                    guard let self, self.shots.isEmpty, !self.isSwitchingLens else { return }
+                    self.applyCameraGeometry()
+                    self.rebuildGrid()
+                }
+
                 prepareSessionDirectory()
                 motion.onSample = { [weak self] sample in
                     self?.handle(sample)

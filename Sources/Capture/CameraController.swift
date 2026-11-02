@@ -98,6 +98,13 @@ final class CameraController: NSObject {
     private var latest: (buffer: CVPixelBuffer, timestamp: TimeInterval)?
 
     private(set) var intrinsics = CameraIntrinsics()
+    /// 第一帧到达后按**实际缓冲区尺寸**修正的内参。
+    /// 不能信 `videoRotationAngle`：Apple 文档只说「设置角度不一定旋转像素」，
+    /// 支持该角度也不代表会生效（前置摄像头实测会被静默忽略）。
+    /// 一旦没生效，缓冲区仍是横向的，而按竖屏假设算出的 tanH/tanV 正好宽高颠倒，
+    /// 每帧会被压扁 1.78 倍 —— 拼出来就是彻底的错乱。
+    var onIntrinsicsChange: ((CameraIntrinsics) -> Void)?
+    private var lastBufferSize: CGSize = .zero
     private(set) var activeLens: CameraLens = .wide
     private(set) var supportsUltraWide = false
     private(set) var imageSize: CGSize = .zero
@@ -236,6 +243,9 @@ final class CameraController: NSObject {
 
         lock.lock()
         latest = nil
+        // 换镜头后视场角变了，但缓冲区尺寸可能完全相同，
+        // 清掉尺寸缓存才能强制下一帧重算内参
+        lastBufferSize = .zero
         lock.unlock()
 
         if wasRunning { session.startRunning() }
@@ -341,28 +351,44 @@ final class CameraController: NSObject {
     }
 
     private func configureIntrinsics(on device: AVCaptureDevice) {
-        let format = device.activeFormat
-        let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        // 首帧之前的猜测值：按「竖屏」假设，长边在竖直方向。
+        // 第一帧到达后会被 intrinsicsFor(size:device:) 用真实缓冲区尺寸覆盖。
+        let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        let guess = CGSize(width: CGFloat(min(dims.width, dims.height)),
+                           height: CGFloat(max(dims.width, dims.height)))
+        intrinsics = intrinsicsFor(size: guess, device: device)
+        imageSize = guess
+    }
 
-        // videoFieldOfView 是「传感器横向（长边）」的水平视场角；
-        // 开了畸变校正后要以校正后的视场角为准，否则焦距会算偏，接缝会整体错位。
+    /// 用真实缓冲区尺寸算内参。
+    ///
+    /// 关键点：`videoFieldOfView`（以及畸变校正后的 corrected 版本）描述的是
+    /// **传感器长边**方向的视场角。长边在成片里是横是竖，只有缓冲区尺寸知道，
+    /// 所以这里一律用 `max(w,h)` 定位长边，再按宽高比例分配水平/垂直。
+    /// 这样无论连接是否真的旋转了像素，结果都是自洽的。
+    private func intrinsicsFor(size: CGSize, device: AVCaptureDevice) -> CameraIntrinsics {
+        let format = device.activeFormat
         var deg = format.videoFieldOfView
+        // 畸变校正会裁切并重采样边缘，视场角随之变化；不跟着改，焦距会整体偏。
         if device.isGeometricDistortionCorrectionEnabled {
             let corrected = format.geometricDistortionCorrectedVideoFieldOfView
             if corrected > 5 { deg = corrected }
         }
 
-        let longEdge = Float(max(dims.width, dims.height))
-        let shortEdge = Float(min(dims.width, dims.height))
         let fallback = activeLens.fallbackHorizontalFOV
-        let hfovDeg: Float = (deg > 12 && deg < 150) ? Float(deg) : fallback
-        let focal = (longEdge / 2) / tan(hfovDeg * .pi / 360)
+        let fovDeg: Float = (deg > 12 && deg < 150) ? Float(deg) : fallback
 
-        // 竖屏：长边在竖直方向
-        intrinsics = CameraIntrinsics(tanHalfH: (shortEdge / 2) / focal,
-                                      tanHalfV: (longEdge / 2) / focal,
-                                      crop: activeLens.usableCrop)
-        imageSize = CGSize(width: CGFloat(shortEdge), height: CGFloat(longEdge))
+        let bw = Float(size.width)
+        let bh = Float(size.height)
+        guard bw > 1, bh > 1 else { return intrinsics }
+
+        let longEdge = max(bw, bh)
+        let focal = (longEdge / 2) / tan(fovDeg * .pi / 360)
+        guard focal > 1 else { return intrinsics }
+
+        return CameraIntrinsics(tanHalfH: (bw / 2) / focal,
+                                tanHalfV: (bh / 2) / focal,
+                                crop: activeLens.usableCrop)
     }
 
     // MARK: - 运行
@@ -420,8 +446,16 @@ final class CameraController: NSObject {
     }
 
     /// 把 CVPixelBuffer 编码成 JPEG（后台执行）
+    ///
+    /// 这里会强制把画面统一成「竖屏」输出。原因是 `videoRotationAngle` 只是请求，
+    /// Apple 文档明确写了「设置角度不一定旋转像素」，而且连接支持该角度也不代表会生效
+    /// （前置摄像头实测会被静默忽略）。一旦没生效，缓冲区仍是横向的，
+    /// 此时图像的水平轴对应设备的竖直轴，球面投影会整体错 90° —— 拼出来必然错乱。
     func encodeJPEG(_ buffer: CVPixelBuffer, quality: CGFloat = 0.92) -> Data? {
-        let ci = CIImage(cvPixelBuffer: buffer)
+        var ci = CIImage(cvPixelBuffer: buffer)
+        if ci.extent.height > 0, ci.extent.width > ci.extent.height {
+            ci = ci.oriented(.right)
+        }
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return nil }
         return UIImage(cgImage: cg, scale: 1, orientation: .up).jpegData(compressionQuality: quality)
     }
@@ -458,8 +492,33 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
                        from connection: AVCaptureConnection) {
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+
+        let w = CGFloat(CVPixelBufferGetWidth(pb))
+        let h = CGFloat(CVPixelBufferGetHeight(pb))
+        let size = CGSize(width: w, height: h)
+
         lock.lock()
+        let sizeChanged = (size != lastBufferSize)
+        if sizeChanged { lastBufferSize = size }
         latest = (pb, pts)
         lock.unlock()
+
+        // 第一帧 / 换镜头后：用真实尺寸校正内参，并通知上层重建机位网格
+        if sizeChanged, w > 1, h > 1 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard let device = self.session.inputs
+                    .compactMap({ ($0 as? AVCaptureDeviceInput)?.device }).first else { return }
+                // 编码阶段会把横向缓冲区旋成竖屏，内参必须按「最终竖屏尺寸」算，
+                // 否则 tanH/tanV 会和实际画幅宽高对不上
+                let oriented = w > h ? CGSize(width: h, height: w) : size
+                let updated = self.intrinsicsFor(size: oriented, device: device)
+                self.imageSize = oriented
+                if updated != self.intrinsics {
+                    self.intrinsics = updated
+                    self.onIntrinsicsChange?(updated)
+                }
+            }
+        }
     }
 }

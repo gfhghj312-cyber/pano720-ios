@@ -266,19 +266,43 @@ enum StitchService {
                                                  pyramid: pyr))
             }
             if frames.count == aligned.count {
+                let baseTanH = frames.map(\.tanH)
+                let baseTanV = frames.map(\.tanV)
+                let before = FrameAligner.ghostScore(frames: frames,
+                                                     rotations: frames.map(\.rotation),
+                                                     tanH: baseTanH, tanV: baseTanV)
+
                 let result = FrameAligner.refine(frames: frames, rounds: 4) { p in
                     progress(0.06 + 0.40 * p)
                 }
+                progress(0.46)
+
                 if let result {
-                    rotations = result.rotations
-                    gains = result.gains
-                    residualDeg = Double(result.residualDeg)
-                    pairCount = result.pairs
-                    if abs(result.focalScale - 1) > 0.001 {
-                        for k in 0..<tans.count {
-                            tans[k].h = aligned[k].tanHalfH * result.focalScale
-                            tans[k].v = aligned[k].tanHalfV * result.focalScale
+                    let after = FrameAligner.ghostScore(frames: frames,
+                                                        rotations: result.rotations,
+                                                        tanH: baseTanH, tanV: baseTanV)
+                    // 安全阀。精配准解的是直接法光度误差，初值偏太多、
+                    // 场景纹理重复、或者大面积过曝时，它可能收敛到一个更差的局部解。
+                    // 之前没有校验，一旦它解错，整张全景会比不用它更烂。
+                    // 现在用规范无关的重叠一致度做前后对比，没明显变好就整段丢掉。
+                    let enoughPairs = result.pairs >= max(3, frames.count / 3)
+                    let improved = (before < 0 || after < 0) || after < before * 0.97
+                    if enoughPairs && improved {
+                        rotations = result.rotations
+                        gains = result.gains
+                        residualDeg = Double(result.residualDeg)
+                        pairCount = result.pairs
+                        if abs(result.focalScale - 1) > 0.001 {
+                            for k in 0..<tans.count {
+                                tans[k].h = aligned[k].tanHalfH * result.focalScale
+                                tans[k].v = aligned[k].tanHalfV * result.focalScale
+                            }
                         }
+                    } else {
+                        // 姿态保持陀螺仪原值，只借用亮度增益（它和几何无关，比较安全）
+                        gains = result.gains
+                        residualDeg = -1
+                        pairCount = result.pairs
                     }
                 }
             }

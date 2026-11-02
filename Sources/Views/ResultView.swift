@@ -97,8 +97,12 @@ struct ResultView: View {
     /// 标题下的一行小字：尺寸 / 投影 / 对齐残差（残差越小说明接缝对得越准）
     private var subtitleText: String {
         var s = "\(record.width) × \(record.height) · 等距圆柱投影"
-        if let r = record.alignmentResidual, r > 0 {
-            s += String(format: " · 对齐残差 %.2f°", r)
+        if let r = record.alignmentResidual {
+            if r < 0 {
+                s += " · 精配准未通过校验，已退回陀螺仪姿态"
+            } else if r > 0.0001 {
+                s += String(format: " · 对齐残差 %.2f°", r)
+            }
         }
         return s
     }

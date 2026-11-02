@@ -174,6 +174,63 @@ enum FrameAligner {
                       residualDeg: lastResidual)
     }
 
+    // MARK: - 质量评估
+
+    /// 重叠区一致度：同一处被两帧看到时的灰度 RMS（0..1）。返回 -1 表示无有效帧对。
+    ///
+    /// 这是**规范无关**的 —— 整张全景统一转个角度不会改变它，所以它量的正是
+    /// 肉眼看到的「重影」强度，可以直接拿来做精配准的安全阀：
+    /// 没变好就整段丢掉，宁可退回纯陀螺仪，也不接受把姿态改得更烂的结果。
+    static func ghostScore(frames: [Frame],
+                           rotations: [simd_float3x3],
+                           tanH: [Float],
+                           tanV: [Float]) -> Float {
+        let n = frames.count
+        guard n >= 2, rotations.count == n, tanH.count == n, tanV.count == n else { return -1 }
+
+        var totalW: Float = 0
+        var totalErr: Float = 0
+
+        for i in 0..<n {
+            for j in (i + 1)..<n {
+                guard let a = frames[i].pyramid.first,
+                      let b = frames[j].pyramid.first else { continue }
+
+                let ang = angleBetween(rotations[i].cameraForward, rotations[j].cameraForward)
+                let reach = atan(tanH[i]) + atan(tanV[i])
+                if ang > reach * 1.02 { continue }
+
+                var su: [Float] = []
+                var sv: [Float] = []
+                makeOverlapLattice(ra: rotations[i], rb: rotations[j],
+                                   tanHA: tanH[i], tanVA: tanV[i],
+                                   cropA: frames[i].crop, cropB: frames[j].crop,
+                                   tanHB: tanH[j], tanVB: tanV[j],
+                                   n: 10, su: &su, sv: &sv)
+                guard su.count >= 36 else { continue }
+
+                let rbt = rotations[j].transpose
+                var sum: Float = 0
+                var cnt: Float = 0
+                for k in 0..<su.count {
+                    let w = rotations[i] * pixelDir(su[k], sv[k], tanH[i], tanV[i])
+                    let c = rbt * w
+                    guard -c.z > 1e-5 else { continue }
+                    let u = 0.5 + 0.5 * (c.x / -c.z) / tanH[j]
+                    let v = 0.5 - 0.5 * (c.y / -c.z) / tanV[j]
+                    guard u > 0.01, u < 0.99, v > 0.01, v < 0.99 else { continue }
+                    let d = a.sample(su[k], sv[k]) - b.sample(u, v)
+                    sum += d * d
+                    cnt += 1
+                }
+                guard cnt >= 60 else { continue }
+                totalErr += sqrt(sum / cnt) * cnt
+                totalW += cnt
+            }
+        }
+        return totalW > 0 ? totalErr / totalW : -1
+    }
+
     // MARK: - 单对求解
 
     private struct PairOutcome {
