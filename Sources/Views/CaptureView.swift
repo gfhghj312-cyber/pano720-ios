@@ -298,6 +298,8 @@ struct CaptureView: View {
         do {
             let panorama = try await model.stitch()
             if let record = store.save(panorama, shotCount: model.shots.count) {
+                // 先导出一份原始帧 + 姿态，再清临时文件（诊断用，只留最后一次）
+                model.exportDiagnostics(for: panorama)
                 model.cleanupWorkingFiles()
                 savedRecord = record
             }

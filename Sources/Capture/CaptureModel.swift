@@ -393,6 +393,12 @@ final class CaptureModel {
         }
     }
 
+    /// 把本次拍摄的原始帧 + 姿态导出一份到文档目录（诊断用，覆盖上一次）
+    func exportDiagnostics(for panorama: StitchedPanorama) {
+        guard let dir = sessionDir else { return }
+        DiagnosticsExport.export(shots: shots, sessionDir: dir, panorama: panorama)
+    }
+
     func cleanupWorkingFiles() {
         guard let dir = sessionDir else { return }
         try? FileManager.default.removeItem(at: dir)
