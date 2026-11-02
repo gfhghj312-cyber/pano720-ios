@@ -18,8 +18,9 @@
 | 自动快门 | 目标机位角误差 < 2.2° 且 0.4s 内抖动 < 0.9° 时自动拍摄 |
 | 手动模式 | 关闭自动后可手动按快门，未对准也允许拍（像素依然参与拼接） |
 | 姿态对齐 | 按视频帧 PTS 在姿态历史里做四元数插值，补偿视频流 1~2 帧延迟 |
-| 姿态精配准 | 用重叠区的光度误差解每帧的小旋转（图像金字塔由粗到精 + 全局法方程），把陀螺仪漂移修回来 |
-| 拼接 | Metal compute shader：逐像素求世界射线 → 反投影到每帧采样 → 边缘羽化 + cos³ 加权混合 |
+| 姿态对齐 | OpenCV SIFT/ORB 特征 + RANSAC 单应解相对旋转，再做全局旋转平均，把陀螺仪 1~3° 的漂移修回来 |
+| 拼接 | Metal compute shader：逐像素求世界射线 → 反投影到每帧采样 → cos³ 加权混合 |
+| 融合 | 两频段：宽羽化的低频 + 窄羽化的高频，接缝看不见、重影限制在几像素内 |
 | 补洞 | 第二轮对未覆盖像素放宽边界做边缘外推，杜绝黑块 |
 | 曝光校正 | 用重叠区亮度比解逐帧增益（0.70–1.45），比全局均值回归准得多 |
 | 输出 | 4096×2048 等距圆柱 JPEG，可存相册 / 分享 / 在 App 内拖动查看 |
@@ -38,9 +39,18 @@
 
 ```bash
 brew install xcodegen
+# 先准备好 OpenCV 静态框架（CI 会自动下载并缓存，本地要手动来一次）
+mkdir -p Vendor
+curl -L -o /tmp/opencv.zip https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-ios-framework.zip
+ditto -x -k /tmp/opencv.zip Vendor      # 必须用 ditto，unzip 会把框架里的符号链接拆坏
+
 xcodegen generate
 open Pano720.xcodeproj     # 真机调试需要自己选 Team 签名
 ```
+
+> OpenCV 是静态框架（arm64 设备 + x86_64 模拟器），链接后二进制约 6.8 MB。
+> 注意 OpenCV 5 改了模块名（`features2d`→`features`、`calib3d` 拆成 `calib`/`geometry`），
+> `findHomography` 在 `geometry.hpp` 里，AKAZE 已被移除 —— 这份代码按 5.0 写。
 
 ## 自签注意点
 
@@ -56,10 +66,35 @@ open Pano720.xcodeproj     # 真机调试需要自己选 Team 签名
 3. 天顶那张需要把手机竖起来对准天花板；天底（脚下）是可选的，不拍也能出图。
 4. 光线均匀的环境效果最好；逆光/高反差时拼接处会有轻微色差（当前只做了亮度增益校正）。
 
-## 拼接原理（为什么不用 OpenCV）
+## 拼接原理
 
-每张照片都记录了 CoreMotion 的**姿态四元数**（`.xArbitraryZVertical` 参考系，Z 轴垂直），
-因此每帧在球面上的位置是已知的，不需要做特征点匹配：
+分两段：**先修姿态（OpenCV 特征）**，再用姿态做球面重投影 + 两频段融合。
+
+### 第一段：姿态从哪来
+
+每张照片都记录了 CoreMotion 的姿态四元数（`.xArbitraryZVertical` 参考系，Z 轴垂直），
+但陀螺仪拍一整圈会漂 1~3°，直接用会把同一根门框画两遍（就是肉眼看到的半透明重影）。
+所以真机上一律先跑一次特征对齐：
+
+```
+每帧与视场最近的 4 个邻居：SIFT（弱纹理退回 ORB）→ 交叉校验/比值筛选 → RANSAC 单应 H
+纯旋转模型下 H = K·R·K⁻¹ 与深度无关，所以 R = K⁻¹HK 是精确解（再 SVD 正交化）
+把「Rⱼᵀ Rᵢ = Mᵢⱼ」当约束，装配 3N×3N 正规方程解出每帧修正量（旋转平均），12 轮
+```
+
+**为什么这一层要交给 OpenCV**：自己写直接法光度配准的收敛范围只有 0.8°，
+且对曝光变化和重复纹理极敏感；特征匹配是这一类问题的成熟解法，SIFT 对尺度/旋转/光照都稳。
+OpenCV 只用来算「相对旋转」这一件事，球面投影和融合仍然自己控制（输出严格 2:1 等距圆柱）。
+
+**阻尼是必须的**：环状机位图的结构矩阵有一类「整体缓慢旋转」的弱约束方向，接近奇异。
+不压住的话修正量会逐轮指数放大（实测 3.6→2.3→2.6→3.1→4.1→5.4→7.2°），3 轮后整圈姿态飞出 23°。
+`Tools/verify_rotation_averaging.py` 把这个坑固化了，含发散对照组。
+
+失败链：特征对齐（与陀螺仪差 >25° 就放弃）→ 光度配准 → 纯陀螺仪。结果页会显示实际走的哪条。
+
+### 第二段：重投影
+
+有了姿态，每帧在球面上的位置就确定了：
 
 ```
 对输出等距圆柱图的每个像素 (u,v)：
@@ -74,15 +109,18 @@ open Pano720.xcodeproj     # 真机调试需要自己选 Team 签名
   输出 = Σcolor·wgt / Σwgt   （权重为 0 的像素标记为空洞）
 ```
 
-### 为什么还要光度精配准
+### 两频段融合（接缝和重影的关键）
 
-陀螺仪给的是「足够接近」的姿态，但拍一整圈要几十秒，偏航会漂 1~3°。
-按这个姿态直接混，重叠区就会把同一根门框画两遍 —— 肉眼看到的就是半透明重影。
+单频段羽化只能在两个坏结果里二选一：羽化窄了接缝硬、羽化宽了错位被摊成大片半透明重影。
+所以渲染三趟再合成：
 
-所以拼接前多一步 `FrameAligner`：对每对有重叠的帧，固定一帧、解另一帧的小旋转 δ
-（外加一个焦距缩放 σ），最小化重叠区的光度误差；图像金字塔由粗到精，粗层负责把 1~3° 的
-大错位拉回收敛域。所有成对结果再按「δᵢ − δⱼ = d」装配成 3N×3N 正规方程一次解出
-（旋转平均 / bundle adjustment 的简化版），迭代 4 轮。
+| 层 | 分辨率 | 羽化 | 作用 |
+| --- | --- | --- | --- |
+| 高频 | 全分辨率 | 0.055 | 保留锐度，错位只影响几像素 |
+| 低频 | 1/4 | 0.30 | 接缝和曝光差被抹平 |
+| 低频参照 | 1/4 | 0.055 | 用来把高频从窄羽化结果里分离出来 |
+
+`out = 低频(宽) + [高频(窄) − 低频(窄)]`，也就是把宽羽化的低频和窄羽化的高频拼起来。
 
 整张 4096×2048 一次 compute dispatch 完成。所有源帧打包成一个 `texture2d_array`，
 单次绑定，避免 30 多个纹理参数；源图降采样尺寸按张数动态计算，显存占用控制在 ~170MB。
@@ -100,9 +138,11 @@ open Pano720.xcodeproj     # 真机调试需要自己选 Team 签名
 | 拼接更顺滑 | 同上调大（0.24） |
 | 输出更高分辨率 | `CaptureModel.stitch()` 里 `outWidth: 4096` → 8192（内存翻 4 倍） |
 | 自动快门更灵敏 | `CaptureModel.handle()` 里 `alignmentDeg < 2.2` 与 `0.016`（抖动阈值） |
-| 羽化范围 | `StitchService.featherWidth`（0.07；调大接缝更柔但重影带更宽） |
-| 精配准强度 | `FrameAligner.refine(rounds:)`（4 轮；调到 1 更快但收敛不彻底） |
-| 配准采样密度 | `FrameAligner.pyramid(shortEdge:)`（288；图像越清晰的手机可以调大） |
+| 羽化范围 | `StitchService.narrowFeather` / `wideFeather`（0.055 / 0.30） |
+| 配准轮数 | `FeatureAligner.align()` 的 `for _ in 0..<12`（少于 8 收敛不干净） |
+| 阻尼强度 | `FeatureAligner` 里 `A[k*dim+k] += 0.6`（调到 1e-3 会发散，见验证脚本） |
+| 每帧匹配邻居数 | `FeatureAligner.align(maxNeighbors:)`（4；调大更稳但更慢） |
+| 特征图尺寸 | `PanoCVMatcher.mm` 里 `grayMat(..., 600, ...)`（调大更准但更慢） |
 | 超广角裁切比例 | `CameraLens.usableCrop`（0.92；调到 1.0 用满整块传感器，边角会变软） |
 | 曝光校正强度 | `FrameAligner.solveGains` 里的钳制区间 `0.70...1.45` |
 
@@ -150,7 +190,9 @@ Sources/
   Capture/CameraController.swift AVFoundation 采集（视频流，逐帧已知朝向）
   Capture/CaptureModel.swift    状态机：对齐判定 / 自动快门 / 拼接调度
   Stitch/StitchService.swift    Metal 拼接内核 + 调度
-  Stitch/FrameAligner.swift     光度精配准（修陀螺仪漂移）+ 逐帧增益
+  Stitch/FeatureAligner.swift   OpenCV 特征对齐 + 旋转平均 + 逐帧增益（主引擎）
+  Stitch/PanoCVMatcher.mm       OpenCV 封装（SIFT/ORB + RANSAC 单应 → 相对旋转）
+  Stitch/FrameAligner.swift     直接法光度配准（后备引擎）
   Views/                        界面
 .github/workflows/build-ipa.yml 免签打包
 Tools/make_icon.py              程序化生成 App 图标
