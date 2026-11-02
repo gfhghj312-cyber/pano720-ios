@@ -1,6 +1,9 @@
 #import "PanoCVMatcher.h"
 
+// OpenCV 5 的模块改名了：features2d -> features，calib3d 拆成 calib / geometry，
+// findHomography 与 RANSAC 现在在 geometry/3d.hpp（由 geometry.hpp 聚合）。
 #import <opencv2/opencv.hpp>
+#import <opencv2/geometry.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -81,6 +84,41 @@ static simd_float3x3 toSimd(const cv::Mat &R) {
     return m;
 }
 
+/// 特征检测 + KNN 匹配 + Lowe 比值筛选。任何一步不够就用返回值 false 表示。
+template <typename Det>
+static bool detectAndMatch(const cv::Ptr<Det> &detector,
+                           int normType,
+                           double ratio,
+                           const cv::Mat &g1,
+                           const cv::Mat &g2,
+                           std::vector<cv::Point2f> &pa,
+                           std::vector<cv::Point2f> &pb,
+                           int &rawMatches) {
+    if (detector.empty()) return false;
+
+    std::vector<cv::KeyPoint> k1, k2;
+    cv::Mat d1, d2;
+    detector->detectAndCompute(g1, cv::noArray(), k1, d1);
+    detector->detectAndCompute(g2, cv::noArray(), k2, d2);
+    if (k1.size() < 40 || k2.size() < 40) return false;
+    if (d1.empty() || d2.empty() || d1.type() != d2.type()) return false;
+
+    std::vector<std::vector<cv::DMatch>> knn;
+    cv::BFMatcher matcher(normType, false);
+    matcher.knnMatch(d1, d2, knn, 2);
+
+    pa.clear();
+    pb.clear();
+    for (const auto &m : knn) {
+        if (m.size() < 2) continue;
+        if (m[0].distance >= ratio * m[1].distance) continue;
+        pa.push_back(k1[m[0].queryIdx].pt);
+        pb.push_back(k2[m[0].trainIdx].pt);
+    }
+    rawMatches = (int)pa.size();
+    return pa.size() >= 24;
+}
+
 // MARK: - 入口
 
 + (nullable PanoCVPair *)matchImageA:(CGImageRef)imageA
@@ -90,49 +128,29 @@ static simd_float3x3 toSimd(const cv::Mat &R) {
     if (tanHalfH < 0.05 || tanHalfV < 0.05) return nil;
 
     cv::Mat g1, g2;
-    if (!grayMat(imageA, 720, g1)) return nil;
-    if (!grayMat(imageB, 720, g2)) return nil;
+    if (!grayMat(imageA, 600, g1)) return nil;
+    if (!grayMat(imageB, 600, g2)) return nil;
 
-    // 1) 特征：ORB 足够快；纹理太少时退回 AKAZE（更抗尺度/低对比）
-    std::vector<cv::KeyPoint> k1, k2;
-    cv::Mat d1, d2;
+    // 1) 特征。SIFT 是这里的主力：尺度和旋转不变，弱纹理/大角度下比 ORB 稳得多；
+    //    纹理实在太少时退回 ORB（对低对比更宽容一点）。
+    std::vector<cv::Point2f> pa, pb;
+    int rawMatches = 0;
+    bool matched = false;
     try {
-        cv::Ptr<cv::ORB> orb = cv::ORB::create(1600, 1.2f, 8, 31, 0, 2,
-                                               cv::ORB::HARRIS_SCORE, 31, 12);
-        orb->detectAndCompute(g1, cv::noArray(), k1, d1);
-        orb->detectAndCompute(g2, cv::noArray(), k2, d2);
-
-        if (k1.size() < 80 || k2.size() < 80) {
-            cv::Ptr<cv::AKAZE> ak = cv::AKAZE::create();
-            ak->detectAndCompute(g1, cv::noArray(), k1, d1);
-            ak->detectAndCompute(g2, cv::noArray(), k2, d2);
+        matched = detectAndMatch(cv::SIFT::create(1400), cv::NORM_L2, 0.78,
+                                 g1, g2, pa, pb, rawMatches);
+        if (!matched) {
+            matched = detectAndMatch(cv::ORB::create(1800, 1.2f, 8, 31, 0, 2,
+                                                     cv::ORB::HARRIS_SCORE, 31, 8),
+                                     cv::NORM_HAMMING, 0.80,
+                                     g1, g2, pa, pb, rawMatches);
         }
     } catch (const cv::Exception &) {
         return nil;
     }
+    if (!matched || pa.size() < 24) return nil;
 
-    if (k1.size() < 20 || k2.size() < 20) return nil;
-    if (d1.type() != d2.type()) return nil;
-
-    // 2) 交叉校验匹配（都是一次性比完，交叉校验能干掉大半误匹配）
-    std::vector<cv::DMatch> matches;
-    try {
-        cv::BFMatcher matcher(cv::NORM_HAMMING, true);
-        matcher.match(d1, d2, matches);
-    } catch (const cv::Exception &) {
-        return nil;
-    }
-    if (matches.size() < 24) return nil;
-
-    std::vector<cv::Point2f> pa, pb;
-    pa.reserve(matches.size());
-    pb.reserve(matches.size());
-    for (const auto &m : matches) {
-        pa.push_back(k1[m.queryIdx].pt);
-        pb.push_back(k2[m.trainIdx].pt);
-    }
-
-    // 3) RANSAC 单应。纯旋转时所有深度都满足同一个 H，所以单应模型正好
+    // 2) RANSAC 单应。纯旋转时所有深度都满足同一个 H，所以单应模型正好是精确模型
     cv::Mat inlierMask;
     cv::Mat H;
     try {
@@ -144,9 +162,9 @@ static simd_float3x3 toSimd(const cv::Mat &R) {
 
     const int inliers = cv::countNonZero(inlierMask);
     if (inliers < 24) return nil;
-    if ((double)inliers / (double)matches.size() < 0.20) return nil;
+    if ((double)inliers / (double)pa.size() < 0.20) return nil;
 
-    // 4) H = K · R · K⁻¹  →  R = K⁻¹ · H · K，再正交化回 SO(3)
+    // 3) H = K · R · K⁻¹  →  R = K⁻¹ · H · K，再正交化回 SO(3)
     const double fx = ((double)g1.cols * 0.5) / tanHalfH;
     const double fy = ((double)g1.rows * 0.5) / tanHalfV;
     const double cx = (double)g1.cols * 0.5;
@@ -170,20 +188,20 @@ static simd_float3x3 toSimd(const cv::Mat &R) {
         R = U2 * Vt;
     }
 
-    // 5) 换回本工程的相机约定：像素 y 向下 → 相机 y 向上
+    // 4) 换回本工程的相机约定：像素 y 向下 → 相机 y 向上
     //    S = diag(1, -1, -1)，R_ours = S · R_cv · S
     cv::Mat S = (cv::Mat_<double>(3, 3) << 1, 0, 0,
                                             0, -1, 0,
                                             0, 0, -1);
     cv::Mat Rours = S * R * S;
 
-    // 6) 合理性：纯旋转不可能一步转太多；SVD 的中间奇异值必须接近 1
+    // 5) 合理性：纯旋转不可能一步转太多
     double tr = Rours.at<double>(0, 0) + Rours.at<double>(1, 1) + Rours.at<double>(2, 2);
     double cosA = std::max(-1.0, std::min(1.0, (tr - 1.0) * 0.5));
     const double angleDeg = std::acos(cosA) * 180.0 / 3.14159265358979323846;
     if (angleDeg > 45.0) return nil;
 
-    // 7) 亮度比（供逐帧增益用）
+    // 6) 亮度比（供逐帧增益用）
     std::vector<double> ratios;
     ratios.reserve(inliers);
     const uchar *mask = inlierMask.ptr<uchar>(0);
@@ -193,20 +211,20 @@ static simd_float3x3 toSimd(const cv::Mat &R) {
         const double b = patchMean(g2, pb[i]);
         if (a > 6.0 && b > 6.0) ratios.push_back(b / a);
     }
-    double ratio = 1.0;
+    double ratioGain = 1.0;
     if (!ratios.empty()) {
         std::vector<double> logs;
         logs.reserve(ratios.size());
         for (double r : ratios) logs.push_back(std::log(std::max(1e-3, r)));
-        ratio = std::exp(medianOf(logs));
+        ratioGain = std::exp(medianOf(logs));
     }
-    ratio = std::max(0.4, std::min(2.5, ratio));
+    ratioGain = std::max(0.4, std::min(2.5, ratioGain));
 
     PanoCVPair *out = [PanoCVPair new];
     out.rotation = toSimd(Rours);
     out.inliers = (NSInteger)inliers;
-    out.rawMatches = (NSInteger)matches.size();
-    out.brightnessRatio = ratio;
+    out.rawMatches = (NSInteger)rawMatches;
+    out.brightnessRatio = ratioGain;
     return out;
 }
 
