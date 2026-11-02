@@ -24,6 +24,11 @@ final class MotionService {
 
     /// 判定结果：attitude.rotationMatrix 是否为「参考系 -> 设备」
     private(set) var attitudeIsWorldToDevice: Bool?
+    /// 判定投票：单帧误差差不够大时容易误判，用多数票锁定，避免中途翻转。
+    /// 一旦翻转，之前存进 history 的四元数会和新值混在一起，插值出来的是垃圾，
+    /// 整张全景就废了 —— 这比判错方向更隐蔽，也更要命。
+    private var voteWorldToDevice = 0
+    private var voteDeviceToWorld = 0
 
     private struct Entry {
         let timestamp: TimeInterval
@@ -44,15 +49,23 @@ final class MotionService {
             let rawQuat = simd_quatf(ix: Float(raw.x), iy: Float(raw.y), iz: Float(raw.z), r: Float(raw.w))
             let rawMatrix = simd_float3x3(rawQuat)
 
-            // 用重力反推旋转方向
+            // 用重力反推旋转方向：多帧投票，攒够 20 票才锁定，锁完不再改
             let g = motion.gravity
             let gravityDevice = Vec3(Float(g.x), Float(g.y), Float(g.z))
-            if simd_length(gravityDevice) > 0.35 {
+            if attitudeIsWorldToDevice == nil, simd_length(gravityDevice) > 0.35 {
                 let down = Vec3(0, 0, -1)
                 let errRaw = simd_length(rawMatrix * down - gravityDevice)          // R = 参考系->设备
                 let errT = simd_length(rawMatrix.transpose * down - gravityDevice)   // R = 设备->参考系
                 if abs(errRaw - errT) > 0.15 {
-                    attitudeIsWorldToDevice = errRaw < errT
+                    if errRaw < errT { voteWorldToDevice += 1 } else { voteDeviceToWorld += 1 }
+                }
+                if voteWorldToDevice + voteDeviceToWorld >= 20 {
+                    let decided = voteWorldToDevice > voteDeviceToWorld
+                    if attitudeIsWorldToDevice != decided {
+                        // 判定变了：之前按旧解释存的历史全部作废
+                        entries.removeAll(keepingCapacity: true)
+                    }
+                    attitudeIsWorldToDevice = decided
                 }
             }
 
