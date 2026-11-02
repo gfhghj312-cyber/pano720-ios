@@ -205,7 +205,7 @@ final class CaptureModel {
         currentRotation = sample.rotation
         currentForward = sample.forward
 
-        if nodes.isEmpty {
+        if nodes.isEmpty, !isSwitchingLens {
             rebuildGrid(forward: sample.forward)
         }
 

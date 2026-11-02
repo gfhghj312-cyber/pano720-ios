@@ -77,7 +77,7 @@ struct ResultView: View {
                 Text("全景已生成")
                     .font(.system(size: 22, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
-                Text("\(record.width) × \(record.height) · 等距圆柱投影")
+                Text(subtitleText)
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.55))
             }
@@ -94,8 +94,16 @@ struct ResultView: View {
         }
     }
 
-    private var stats: some View {
-        HStack(spacing: 10) {
+    /// 标题下的一行小字：尺寸 / 投影 / 对齐残差（残差越小说明接缝对得越准）
+    private var subtitleText: String {
+        var s = "\(record.width) × \(record.height) · 等距圆柱投影"
+        if let r = record.alignmentResidual, r > 0 {
+            s += String(format: " · 对齐残差 %.2f°", r)
+        }
+        return s
+    }
+
+    private var stats: some View {        HStack(spacing: 10) {
             statItem(icon: "square.grid.3x3.fill",
                      title: "拼接帧数",
                      value: "\(record.shotCount)")
