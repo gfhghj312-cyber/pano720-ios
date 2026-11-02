@@ -25,6 +25,8 @@ struct StitchedPanorama {
     /// 精配准后的残余姿态残差（度），越小说明重叠区对得越准
     let residualDeg: Double
     let pairCount: Int
+    /// 实际生效的对齐引擎（用于结果页诊断）
+    let aligner: String
 }
 
 enum StitchError: LocalizedError {
@@ -168,6 +170,28 @@ enum StitchService {
         }
         dst.write(float4(outc, filled), gid);
     }
+
+    // 两频段融合：低频用「宽羽化」的合成结果（过渡平滑、看不见接缝），
+    // 高频用「窄羽化」的结果减去它自己的低频（保留锐度、把重影限制在几像素内）。
+    // 单频段羽化只能在「接缝明显」和「重影变宽」之间二选一，这也是之前反复翻车的原因之一。
+    kernel void composeBands(texture2d<float, access::sample> narrow [[texture(0)]],
+                             texture2d<float, access::sample> wideLow [[texture(1)]],
+                             texture2d<float, access::sample> narrowLow [[texture(2)]],
+                             texture2d<float, access::write> dst [[texture(3)]],
+                             uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) { return; }
+        constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
+
+        float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());
+        float4 n  = narrow.sample(smp, uv);
+        float3 w  = wideLow.sample(smp, uv).rgb;
+        float3 nl = narrowLow.sample(smp, uv).rgb;
+
+        float3 c = w + (n.rgb - nl);
+        // alpha 保留空洞标记，后面统计覆盖率还要用
+        dst.write(float4(clamp(c, 0.0, 1.0), n.a), gid);
+    }
     """
 
     private struct Header {
@@ -185,9 +209,10 @@ enum StitchService {
         var ext = SIMD4<Float>(0, 0, 0, 0)
     }
 
-    /// 接缝羽化宽度（占画幅比例）。配准准了以后可以收窄，
-    //    从 0.11 收到 0.07：过渡带窄了 1.6 倍，重影面积同比例缩小。
-    private static let featherWidth: Float = 0.07
+    /// 高频层的羽化宽度（占画幅比例）：越窄，重叠区的错位越不会被摊成大片半透明。
+    private static let narrowFeather: Float = 0.055
+    /// 低频层的羽化宽度：很宽，保证亮度/色温差异平滑过渡，接缝看不见。
+    private static let wideFeather: Float = 0.30
 
     // MARK: - 入口
 
@@ -206,12 +231,14 @@ enum StitchService {
         } catch {
             throw StitchError.shader(error.localizedDescription)
         }
-        guard let fn = library.makeFunction(name: "stitchPano") else {
-            throw StitchError.shader("找不到 stitchPano")
+        guard let stitchFn = library.makeFunction(name: "stitchPano"),
+              let composeFn = library.makeFunction(name: "composeBands") else {
+            throw StitchError.shader("找不到 stitchPano / composeBands")
         }
-        let pipeline: MTLComputePipelineState
+        let pipes: Pipelines
         do {
-            pipeline = try await device.makeComputePipelineState(function: fn)
+            pipes = Pipelines(stitch: try await device.makeComputePipelineState(function: stitchFn),
+                              compose: try await device.makeComputePipelineState(function: composeFn))
         } catch {
             throw StitchError.shader(error.localizedDescription)
         }
@@ -222,7 +249,7 @@ enum StitchService {
                     let out = try stitchSync(inputs: rawInputs,
                                              outWidth: outWidth,
                                              device: device,
-                                             pipeline: pipeline,
+                                             pipes: pipes,
                                              progress: progress)
                     cont.resume(returning: out)
                 } catch {
@@ -232,12 +259,17 @@ enum StitchService {
         }
     }
 
+    private struct Pipelines {
+        let stitch: MTLComputePipelineState
+        let compose: MTLComputePipelineState
+    }
+
     // MARK: - 主流程（后台线程）
 
     private static func stitchSync(inputs rawInputs: [StitchInput],
                                    outWidth: Int,
                                    device: MTLDevice,
-                                   pipeline: MTLComputePipelineState,
+                                   pipes: Pipelines,
                                    progress: @escaping (Double) -> Void) throws -> StitchedPanorama {
 
         let start = Date()
@@ -246,63 +278,36 @@ enum StitchService {
         let aligned = alignToFirst(rawInputs)
         guard !aligned.isEmpty else { throw StitchError.noInput }
 
-        // 2. 光度精配准：修掉陀螺仪漂移，顺便解出逐帧增益与焦距偏差
+        // 2. 姿态对齐：OpenCV 特征优先 → 光度配准 → 纯陀螺仪
         progress(0.04)
         var rotations = aligned.map(\.rotation)
         var gains = aligned.map { _ in Float(1) }
         var tans = aligned.map { (h: $0.tanHalfH, v: $0.tanHalfV) }
         var residualDeg: Double = 0
         var pairCount = 0
+        var aligner = "陀螺仪"
 
         if aligned.count >= 3 {
-            var frames: [FrameAligner.Frame] = []
-            frames.reserveCapacity(aligned.count)
-            for input in aligned {
-                guard let pyr = FrameAligner.pyramid(url: input.url) else { continue }
-                frames.append(FrameAligner.Frame(rotation: input.rotation,
-                                                 tanH: input.tanHalfH,
-                                                 tanV: input.tanHalfV,
-                                                 crop: input.crop,
-                                                 pyramid: pyr))
-            }
-            if frames.count == aligned.count {
-                let baseTanH = frames.map(\.tanH)
-                let baseTanV = frames.map(\.tanV)
-                let before = FrameAligner.ghostScore(frames: frames,
-                                                     rotations: frames.map(\.rotation),
-                                                     tanH: baseTanH, tanV: baseTanV)
-
-                let result = FrameAligner.refine(frames: frames, rounds: 4) { p in
-                    progress(0.06 + 0.40 * p)
-                }
-                progress(0.46)
-
-                if let result {
-                    let after = FrameAligner.ghostScore(frames: frames,
-                                                        rotations: result.rotations,
-                                                        tanH: baseTanH, tanV: baseTanV)
-                    // 安全阀。精配准解的是直接法光度误差，初值偏太多、
-                    // 场景纹理重复、或者大面积过曝时，它可能收敛到一个更差的局部解。
-                    // 之前没有校验，一旦它解错，整张全景会比不用它更烂。
-                    // 现在用规范无关的重叠一致度做前后对比，没明显变好就整段丢掉。
-                    let enoughPairs = result.pairs >= max(3, frames.count / 3)
-                    let improved = (before < 0 || after < 0) || after < before * 0.97
-                    if enoughPairs && improved {
-                        rotations = result.rotations
-                        gains = result.gains
-                        residualDeg = Double(result.residualDeg)
-                        pairCount = result.pairs
-                        if abs(result.focalScale - 1) > 0.001 {
-                            for k in 0..<tans.count {
-                                tans[k].h = aligned[k].tanHalfH * result.focalScale
-                                tans[k].v = aligned[k].tanHalfV * result.focalScale
-                            }
-                        }
-                    } else {
-                        // 姿态保持陀螺仪原值，只借用亮度增益（它和几何无关，比较安全）
-                        gains = result.gains
-                        residualDeg = -1
-                        pairCount = result.pairs
+            if let feature = FeatureAligner.align(inputs: aligned, progress: { p in
+                progress(0.04 + 0.36 * p)
+            }) {
+                rotations = feature.rotations
+                gains = feature.gains
+                residualDeg = feature.residualDeg
+                pairCount = feature.pairs
+                aligner = "OpenCV 特征"
+            } else if let photo = photometricAlign(aligned, progress: { p in
+                progress(0.42 + 0.05 * p)
+            }) {
+                rotations = photo.rotations
+                gains = photo.gains
+                residualDeg = photo.residualDeg
+                pairCount = photo.pairs
+                if photo.residualDeg >= 0 { aligner = "光度配准" }
+                if abs(photo.focalScale - 1) > 0.001 {
+                    for k in 0..<tans.count {
+                        tans[k] = (h: aligned[k].tanHalfH * photo.focalScale,
+                                   v: aligned[k].tanHalfV * photo.focalScale)
                     }
                 }
             }
@@ -369,7 +374,8 @@ enum StitchService {
             p.r1 = rows[1]
             p.r2 = rows[2]
             p.misc = SIMD4<Float>(tanFullH, tanFullV, gains[i], Float(slice))
-            p.ext = SIMD4<Float>(tanFullH * crop, tanFullV * crop, 0.5 * crop, featherWidth)
+            // w（羽化宽度）在每趟渲染时按频段填，这里先占位
+            p.ext = SIMD4<Float>(tanFullH * crop, tanFullV * crop, 0.5 * crop, 0)
             params.append(p)
             slice += 1
 
@@ -378,54 +384,34 @@ enum StitchService {
 
         guard !params.isEmpty else { throw StitchError.noInput }
 
-        // 7. 输出纹理
-        let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
-                                                               width: outW,
-                                                               height: outH,
-                                                               mipmapped: false)
-        outDesc.usage = [.shaderWrite, .shaderRead]
-        outDesc.storageMode = .shared
-        guard let outTex = device.makeTexture(descriptor: outDesc) else {
-            throw StitchError.texture("输出纹理分配失败")
-        }
+        // 7. 三趟渲染做两频段融合
+        //    高频：全分辨率 + 窄羽化（锐、错位只影响几像素）
+        //    低频：1/4 分辨率 + 宽羽化（接缝和曝光差被抹平），再把它和「窄羽化的低频」相减，
+        //          只把高频细节贴回去。这比单频段羽化在「接缝明显」和「重影变宽」之间二选一要好得多。
+        let lowW = max(64, outW / 4)
+        let lowH = max(32, outH / 4)
 
-        // 8. 执行
-        guard let queue = device.makeCommandQueue(),
-              let cmd = queue.makeCommandBuffer(),
-              let encoder = cmd.makeComputeCommandEncoder() else {
-            throw StitchError.texture("无法创建命令队列")
-        }
+        let narrowTex = try renderPass(device: device, pipeline: pipes.stitch,
+                                       srcTex: srcTex, base: params,
+                                       width: outW, height: outH,
+                                       feather: narrowFeather)
+        progress(0.62)
 
-        encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(srcTex, index: 0)
-        encoder.setTexture(outTex, index: 1)
+        let wideLowTex = try renderPass(device: device, pipeline: pipes.stitch,
+                                        srcTex: srcTex, base: params,
+                                        width: lowW, height: lowH,
+                                        feather: wideFeather)
+        let narrowLowTex = try renderPass(device: device, pipeline: pipes.stitch,
+                                          srcTex: srcTex, base: params,
+                                          width: lowW, height: lowH,
+                                          feather: narrowFeather)
+        progress(0.80)
 
-        var header = Header()
-        header.outW = Int32(outW)
-        header.outH = Int32(outH)
-        header.count = Int32(params.count)
-        encoder.setBytes(&header, length: MemoryLayout<Header>.stride, index: 0)
-
-        // 参数表用 buffer 而不是 setBytes：setBytes 有 4KB 上限，机位多时会超
-        let paramLength = MemoryLayout<ShaderImage>.stride * params.count
-        let paramBuffer: MTLBuffer? = params.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return nil }
-            return device.makeBuffer(bytes: base, length: paramLength, options: .storageModeShared)
-        }
-        guard let paramBuffer else { throw StitchError.texture("参数缓冲分配失败") }
-        encoder.setBuffer(paramBuffer, offset: 0, index: 1)
-
-        let tw = pipeline.threadExecutionWidth
-        let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
-        encoder.dispatchThreads(MTLSize(width: outW, height: outH, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
-        encoder.endEncoding()
-        cmd.commit()
-        cmd.waitUntilCompleted()
-
-        if let err = cmd.error {
-            throw StitchError.texture(err.localizedDescription)
-        }
+        let outTex = try composePass(device: device, pipeline: pipes.compose,
+                                     narrow: narrowTex,
+                                     wideLow: wideLowTex,
+                                     narrowLow: narrowLowTex,
+                                     width: outW, height: outH)
 
         progress(0.86)
 
@@ -485,7 +471,168 @@ enum StitchService {
                                 width: outW,
                                 height: outH,
                                 residualDeg: residualDeg,
-                                pairCount: pairCount)
+                                pairCount: pairCount,
+                                aligner: aligner)
+    }
+
+    // MARK: - 渲染
+
+    /// 用给定分辨率和羽化宽度跑一遍球面投影
+    private static func renderPass(device: MTLDevice,
+                                   pipeline: MTLComputePipelineState,
+                                   srcTex: MTLTexture,
+                                   base: [ShaderImage],
+                                   width: Int,
+                                   height: Int,
+                                   feather: Float) throws -> MTLTexture {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                         width: width,
+                                                         height: height,
+                                                         mipmapped: false)
+        d.usage = [.shaderWrite, .shaderRead]
+        d.storageMode = .shared
+        guard let dst = device.makeTexture(descriptor: d) else {
+            throw StitchError.texture("渲染目标分配失败（\(width)x\(height)）")
+        }
+
+        var imgs = base
+        for k in 0..<imgs.count { imgs[k].ext.w = feather }
+
+        guard let queue = device.makeCommandQueue(),
+              let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw StitchError.texture("无法创建命令队列")
+        }
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(srcTex, index: 0)
+        enc.setTexture(dst, index: 1)
+
+        var header = Header()
+        header.outW = Int32(width)
+        header.outH = Int32(height)
+        header.count = Int32(imgs.count)
+        enc.setBytes(&header, length: MemoryLayout<Header>.stride, index: 0)
+
+        // 参数表用 buffer 而不是 setBytes：setBytes 有 4KB 上限，机位多时会超
+        let length = MemoryLayout<ShaderImage>.stride * imgs.count
+        let paramBuffer: MTLBuffer? = imgs.withUnsafeBytes { raw in
+            guard let p = raw.baseAddress else { return nil }
+            return device.makeBuffer(bytes: p, length: length, options: .storageModeShared)
+        }
+        guard let paramBuffer else { throw StitchError.texture("参数缓冲分配失败") }
+        enc.setBuffer(paramBuffer, offset: 0, index: 1)
+
+        let tw = pipeline.threadExecutionWidth
+        let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
+        enc.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        if let err = cmd.error {
+            throw StitchError.texture(err.localizedDescription)
+        }
+        return dst
+    }
+
+    /// 两频段合成：宽羽化的低频 + 窄羽化的高频
+    private static func composePass(device: MTLDevice,
+                                    pipeline: MTLComputePipelineState,
+                                    narrow: MTLTexture,
+                                    wideLow: MTLTexture,
+                                    narrowLow: MTLTexture,
+                                    width: Int,
+                                    height: Int) throws -> MTLTexture {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                         width: width,
+                                                         height: height,
+                                                         mipmapped: false)
+        d.usage = [.shaderWrite, .shaderRead]
+        d.storageMode = .shared
+        guard let dst = device.makeTexture(descriptor: d) else {
+            throw StitchError.texture("合成目标分配失败")
+        }
+        guard let queue = device.makeCommandQueue(),
+              let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            throw StitchError.texture("无法创建命令队列")
+        }
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(narrow, index: 0)
+        enc.setTexture(wideLow, index: 1)
+        enc.setTexture(narrowLow, index: 2)
+        enc.setTexture(dst, index: 3)
+
+        let tw = pipeline.threadExecutionWidth
+        let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
+        enc.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        if let err = cmd.error {
+            throw StitchError.texture(err.localizedDescription)
+        }
+        return dst
+    }
+
+    // MARK: - 后备：直接法光度配准
+
+    private struct AlignmentResult {
+        var rotations: [simd_float3x3]
+        var gains: [Float]
+        var residualDeg: Double
+        var pairs: Int
+        var focalScale: Float
+    }
+
+    /// 旧引擎（重叠区光度误差 + 旋转平均），只在特征匹配拿不到足够帧对时启用。
+    /// 收敛范围窄（>0.8° 容易掉进局部极小值），但对重复纹理场景是另一套独立证据。
+    private static func photometricAlign(_ aligned: [StitchInput],
+                                         progress: (Double) -> Void) -> AlignmentResult? {
+        var frames: [FrameAligner.Frame] = []
+        frames.reserveCapacity(aligned.count)
+        for input in aligned {
+            guard let pyr = FrameAligner.pyramid(url: input.url) else { return nil }
+            frames.append(FrameAligner.Frame(rotation: input.rotation,
+                                             tanH: input.tanHalfH,
+                                             tanV: input.tanHalfV,
+                                             crop: input.crop,
+                                             pyramid: pyr))
+        }
+        guard frames.count == aligned.count else { return nil }
+
+        let baseTanH = frames.map(\.tanH)
+        let baseTanV = frames.map(\.tanV)
+        let before = FrameAligner.ghostScore(frames: frames,
+                                             rotations: frames.map(\.rotation),
+                                             tanH: baseTanH, tanV: baseTanV)
+
+        guard let result = FrameAligner.refine(frames: frames, rounds: 4, progress: progress) else {
+            return nil
+        }
+        let after = FrameAligner.ghostScore(frames: frames,
+                                            rotations: result.rotations,
+                                            tanH: baseTanH, tanV: baseTanV)
+
+        // 安全阀：规范无关的重叠一致度没有明显改善就整段丢掉
+        let enoughPairs = result.pairs >= max(3, frames.count / 3)
+        let improved = (before < 0 || after < 0) || after < before * 0.97
+        if enoughPairs && improved {
+            return AlignmentResult(rotations: result.rotations,
+                                   gains: result.gains,
+                                   residualDeg: Double(result.residualDeg),
+                                   pairs: result.pairs,
+                                   focalScale: result.focalScale)
+        }
+        // 没用上就只借增益（与几何无关，安全）
+        return AlignmentResult(rotations: aligned.map(\.rotation),
+                               gains: result.gains,
+                               residualDeg: -1,
+                               pairs: result.pairs,
+                               focalScale: 1)
     }
 
     // MARK: - 辅助

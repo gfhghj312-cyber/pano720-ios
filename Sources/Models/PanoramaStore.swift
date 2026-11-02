@@ -13,6 +13,7 @@ struct PanoramaRecord: Codable, Identifiable, Hashable {
     var coverage: Double
     var shotCount: Int
     var alignmentResidual: Double?   // 精配准后的残余姿态残差（度）
+    var aligner: String?             // 实际生效的对齐引擎
 
     var aspect: CGFloat { height > 0 ? CGFloat(width) / CGFloat(height) : 2 }
 }
@@ -71,7 +72,8 @@ final class PanoramaStore {
                                     height: panorama.height,
                                     coverage: panorama.coverage,
                                     shotCount: shotCount,
-                                    alignmentResidual: panorama.residualDeg)
+                                    alignmentResidual: panorama.residualDeg,
+                                    aligner: panorama.aligner)
         items.insert(record, at: 0)
         persist()
         return record

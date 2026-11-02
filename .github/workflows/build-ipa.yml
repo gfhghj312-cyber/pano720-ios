@@ -29,6 +29,29 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: 缓存 OpenCV iOS 框架
+        id: opencv-cache
+        uses: actions/cache@v4
+        with:
+          path: Vendor/opencv2.framework
+          key: opencv-ios-5.0.0-framework-v1
+
+      - name: 准备 OpenCV（静态框架，不嵌入）
+        if: steps.opencv-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p Vendor
+          curl -L --retry 3 --retry-delay 5 -o /tmp/opencv-ios.zip \
+            "https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-ios-framework.zip"
+          # 框架内部是 versioned bundle（Headers/Modules 都是符号链接），必须用 ditto 解，unzip 会丢链接
+          ditto -x -k /tmp/opencv-ios.zip Vendor
+          ls -la Vendor/opencv2.framework
+
+      - name: 校验框架完整
+        run: |
+          test -f Vendor/opencv2.framework/Headers/opencv.hpp
+          test -f Vendor/opencv2.framework/opencv2
+          echo "OpenCV headers: $(ls Vendor/opencv2.framework/Headers | wc -l) 个"
+
       - name: 安装 XcodeGen
         run: brew install xcodegen
 

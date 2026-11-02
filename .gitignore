@@ -23,3 +23,6 @@ xcuserdata/
 dist/
 dist_check_*.png
 __pycache__/
+
+# 二进制依赖（CI 自动下载，禁止入库）
+Vendor/

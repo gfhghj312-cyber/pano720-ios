@@ -40,6 +40,16 @@ targets:
         ENABLE_PREVIEWS: YES
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        # OpenCV 是 C++，Swift 调不了，用 ObjC++ 包一层再桥接过来
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Sources/Stitch/Pano720-Bridging-Header.h"
+        CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+        CLANG_CXX_LIBRARY: "libc++"
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Vendor"
+        OTHER_LDFLAGS: "$(inherited) -lc++"
+    dependencies:
+      # 静态框架，不嵌入（免签打包更省事，签名时也不用管嵌套 framework）
+      - framework: Vendor/opencv2.framework
+        embed: false
 
 schemes:
   Pano720:
