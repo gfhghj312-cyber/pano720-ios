@@ -591,7 +591,7 @@ enum StitchService {
     /// 旧引擎（重叠区光度误差 + 旋转平均），只在特征匹配拿不到足够帧对时启用。
     /// 收敛范围窄（>0.8° 容易掉进局部极小值），但对重复纹理场景是另一套独立证据。
     private static func photometricAlign(_ aligned: [StitchInput],
-                                         progress: (Double) -> Void) -> AlignmentResult? {
+                                         progress: @escaping (Double) -> Void) -> AlignmentResult? {
         var frames: [FrameAligner.Frame] = []
         frames.reserveCapacity(aligned.count)
         for input in aligned {
