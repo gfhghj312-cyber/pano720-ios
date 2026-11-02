@@ -7,6 +7,7 @@ struct CaptureView: View {
     @State private var model = CaptureModel()
     @State private var flashOpacity: Double = 0
     @State private var savedRecord: PanoramaRecord?
+    @State private var pendingStitch = false
 
     var body: some View {
         ZStack {
@@ -53,6 +54,16 @@ struct CaptureView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .confirmationDialog("还有 \(max(0, model.requiredCount - model.shots.count)) 个方向没拍",
+                            isPresented: $pendingStitch,
+                            titleVisibility: .visible) {
+            Button("继续拍摄", role: .cancel) {}
+            Button("仍然拼接", role: .destructive) {
+                Task { await finish() }
+            }
+        } message: {
+            Text("已拍 \(model.shots.count) 张，这个机位配置需要约 \(model.requiredCount) 张才能覆盖整圈。没拍到的方向会留空，重叠不够的地方会错位。")
+        }
         .task {
             model.start()
         }
@@ -106,7 +117,11 @@ struct CaptureView: View {
             Spacer(minLength: 0)
 
             Button {
-                Task { await finish() }
+                if shouldWarnIncomplete {
+                    pendingStitch = true
+                } else {
+                    Task { await finish() }
+                }
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "wand.and.stars")
@@ -289,6 +304,12 @@ struct CaptureView: View {
         } catch {
             // model.phase 已带上错误信息
         }
+    }
+
+    /// 拍摄不足时先拦一下：没覆盖到的方向拼出来必然是空白 + 错位，
+    /// 直接拼会让人以为是拼接算法坏了。
+    private var shouldWarnIncomplete: Bool {
+        model.shots.count >= 2 && model.shots.count * 100 < model.requiredCount * 85
     }
 }
 
