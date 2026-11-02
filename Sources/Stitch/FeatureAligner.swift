@@ -111,8 +111,9 @@ enum FeatureAligner {
         guard gyroMedian < 25 else { return nil }
 
         // 5) 旋转平均：反复线性化，解 3N 个局部修正量
+        //    迭代上限给到 12：加了阻尼之后每轮只走一部分，6 轮收敛不干净。
         var R = inputs.map(\.rotation)
-        for _ in 0..<6 {
+        for _ in 0..<12 {
             let dim = 3 * n
             var A = [Float](repeating: 0, count: dim * dim)
             var rhs = [Float](repeating: 0, count: dim)
@@ -142,9 +143,13 @@ enum FeatureAligner {
                 for k in 0..<3 { rhs[aj + k] += w * atr[k] }
             }
 
-            // 钉住第 0 帧（只消除整体规范自由度）+ 极轻阻尼
-            for k in 0..<3 { A[k * dim + k] += 1000 }
-            for k in 0..<dim { A[k * dim + k] += 1e-3 }
+            // 阻尼是必须的，不是保守：环状图里存在一类「整体缓慢旋转」的弱约束方向，
+            // 结构矩阵在那上面接近奇异。不压住的话步长会逐轮指数放大
+            // （实测 3.6°→2.3°→2.6°→3.1°→4.1°→5.4°→7.2°），第 3 轮之后整圈姿态就飞了。
+            // 仿真标定：lambda≈0.6 时 cost 0.0152→0.0028，相对姿态误差 0.79°→0.43°。
+            for k in 0..<dim { A[k * dim + k] += 0.6 }
+            // 钉住第 0 帧（只消除整体规范自由度）
+            for k in 0..<3 { A[k * dim + k] += 1e4 }
 
             guard let delta = solve(&A, &rhs, dim) else { return nil }
 
