@@ -26,3 +26,7 @@ __pycache__/
 
 # 二进制依赖（CI 自动下载，禁止入库）
 Vendor/
+
+# 分析用临时图片
+*_now.png
+flip_*.png
