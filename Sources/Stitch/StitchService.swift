@@ -686,7 +686,9 @@ enum StitchService {
                                       space: colorSpace,
                                       bitmapInfo: info) else { return }
             ctx.interpolationQuality = .high
-            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+            // Metal 纹理是顶行优先；CGBitmapContext 默认左下原点，必须翻一次。
+            // 这里曾经漏翻，导致 OpenCV 看到的是正帧、Metal 拿到的是倒帧。
+            ImageDecoding.drawTopDown(cg, in: ctx, width: width, height: height)
         }
         return data
     }

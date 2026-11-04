@@ -623,7 +623,8 @@ enum FrameAligner {
                                       space: gray,
                                       bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
             ctx.interpolationQuality = .high
-            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            // Gray.data 与 shader / OpenCV 一样按顶行优先；左下原点的 context 需要翻转
+            ImageDecoding.drawTopDown(cg, in: ctx, width: w, height: h)
             ok = true
         }
         guard ok else { return nil }
