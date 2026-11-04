@@ -27,6 +27,8 @@ enum DiagnosticsExport {
         let createdAt: String
         let shotCount: Int
         let aligner: String
+        let calibration: String       // 真机实测出的图像朝向 / 焦距修正
+        let rotationNote: String      // 说明 frames.rotation 是校准前还是校准后
         let residualDeg: Double
         let pairCount: Int
         let coverage: Double
@@ -81,6 +83,8 @@ enum DiagnosticsExport {
         let meta = SessionMeta(createdAt: formatter.string(from: Date()),
                                shotCount: shots.count,
                                aligner: panorama.aligner,
+                               calibration: panorama.calibration,
+                               rotationNote: "frames[].rotation 是陀螺仪原始姿态；拼接时右乘了 calibration 里的朝向矩阵 Qᵀ",
                                residualDeg: panorama.residualDeg,
                                pairCount: panorama.pairCount,
                                coverage: panorama.coverage,
