@@ -14,6 +14,7 @@ struct PanoramaRecord: Codable, Identifiable, Hashable {
     var shotCount: Int
     var alignmentResidual: Double?   // 精配准后的残余姿态残差（度）
     var aligner: String?             // 实际生效的对齐引擎
+    var calibration: String?         // 真机朝向自校准结果
 
     var aspect: CGFloat { height > 0 ? CGFloat(width) / CGFloat(height) : 2 }
 }
@@ -73,7 +74,8 @@ final class PanoramaStore {
                                     coverage: panorama.coverage,
                                     shotCount: shotCount,
                                     alignmentResidual: panorama.residualDeg,
-                                    aligner: panorama.aligner)
+                                    aligner: panorama.aligner,
+                                    calibration: panorama.calibration)
         items.insert(record, at: 0)
         persist()
         return record

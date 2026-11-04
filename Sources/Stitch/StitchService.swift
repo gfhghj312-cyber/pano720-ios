@@ -27,6 +27,8 @@ struct StitchedPanorama {
     let pairCount: Int
     /// 实际生效的对齐引擎（用于结果页诊断）
     let aligner: String
+    /// 真机朝向自校准结果（用于结果页诊断）
+    let calibration: String
 }
 
 enum StitchError: LocalizedError {
@@ -275,8 +277,17 @@ enum StitchService {
         let start = Date()
 
         // 1. 让第一张的位置落在等距圆柱图的中心（经度 0）
-        let aligned = alignToFirst(rawInputs)
-        guard !aligned.isEmpty else { throw StitchError.noInput }
+        let firstAligned = alignToFirst(rawInputs)
+        guard !firstAligned.isEmpty else { throw StitchError.noInput }
+
+        // 1b. 在真机上实测图像朝向与焦距，不再靠桌面端推断 Core Graphics 行序 /
+        //     videoRotationAngle 是否生效 / videoFieldOfView 的含义。
+        //     探测结果直接吸收进每帧姿态（R' = R·Qᵀ），后面的特征匹配、光度配准、
+        //     Metal 采样因此自动共用同一个正确方向。
+        progress(0.01)
+        let calibration = OrientationProbe.calibrate(firstAligned)
+        let aligned = calibration?.inputs ?? firstAligned
+        let calibrationText = calibration?.info.display ?? "朝向校准：帧数不足，未启用"
 
         // 2. 姿态对齐：OpenCV 特征优先 → 光度配准 → 纯陀螺仪
         progress(0.04)
@@ -472,7 +483,8 @@ enum StitchService {
                                 height: outH,
                                 residualDeg: residualDeg,
                                 pairCount: pairCount,
-                                aligner: aligner)
+                                aligner: aligner,
+                                calibration: calibrationText)
     }
 
     // MARK: - 渲染

@@ -80,6 +80,11 @@ struct ResultView: View {
                 Text(subtitleText)
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.55))
+                if let c = record.calibration, !c.isEmpty {
+                    Text(c)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.cyan.opacity(0.85))
+                }
             }
             Spacer()
             Button(action: onDone) {
