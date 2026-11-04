@@ -165,6 +165,18 @@ pip install numpy pillow && python Tools/verify_stitch.py
 误差图和真值逐像素比是均匀的，只剩等距圆柱极区固有的 1~2 行拉伸 —— 没有任何接缝条带。
 加上 ±0.7° 的随机姿态误差后 PSNR 几乎不变，说明混合权重对几度以内的漂移不敏感。
 
+## 图像方向约定（非常重要）
+
+所有原始像素缓冲区统一为**顶行优先**（内存第 0 行 = 图像顶行）：
+
+- OpenCV 灰度图：`PanoCVMatcher.mm` 中翻转 CTM；
+- Metal 源纹理：`StitchService.downsampledRGBA()` 调 `ImageDecoding.drawTopDown`；
+- 光度配准金字塔：`FrameAligner.pyramid()` 调同一个函数。
+
+`CGBitmapContext` 默认左下原点，而 Metal 纹理顶行优先。两条读图路径若方向不一致，
+即使姿态、内参和 OpenCV 都正确，拼出来仍会是大面积半透明重影。
+仿真中把源帧上下颠倒会让 PSNR 从 29.2 掉到 12.0。
+
 ## 已知限制
 
 - 精配准解的是「旋转」，不建稀疏点云、不做完整 bundle adjustment，也不处理视差（机位平移）。
