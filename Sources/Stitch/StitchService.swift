@@ -102,7 +102,6 @@ enum StitchService {
 
         float3 acc = float3(0.0);
         float wsum = 0.0;
-
         // 第一轮：严格落在画幅内，按到裁切边长度的距离羽化
         for (int i = 0; i < hp.count; ++i) {
             Img im = imgs[i];
@@ -398,7 +397,10 @@ enum StitchService {
         // 7. 三趟渲染做两频段融合
         //    高频：全分辨率 + 窄羽化（锐、错位只影响几像素）
         //    低频：1/4 分辨率 + 宽羽化（接缝和曝光差被抹平），再把它和「窄羽化的低频」相减，
-        //          只把高频细节贴回去。这比单频段羽化在「接缝明显」和「重影变宽」之间二选一要好得多。
+        //          只把高频细节贴回去。
+        //    注：试过把高频改成「每像素只取一帧」的 Voronoi 接缝（Street View 的
+        //        seam_finder 思路），但 Tools/verify_seam.py 证明在两频段合成后
+        //        会出现白色亮斑、PSNR 反降 1.5dB，需要完整 graphcut 才成立，故未采用。
         let lowW = max(64, outW / 4)
         let lowH = max(32, outH / 4)
 
@@ -466,10 +468,12 @@ enum StitchService {
             throw StitchError.encode
         }
 
-        guard let jpeg = UIImage(cgImage: cg, scale: 1, orientation: .up)
+        guard let rawJPEG = UIImage(cgImage: cg, scale: 1, orientation: .up)
             .jpegData(compressionQuality: 0.92) else {
             throw StitchError.encode
         }
+        // 注入 GPano XMP：不写这段，系统「照片」只会把它当一张普通超宽图
+        let jpeg = PhotoSphereMetadata.inject(into: rawJPEG, width: outW, height: outH)
 
         let thumbnail = makeThumbnail(from: cg)
         progress(1.0)

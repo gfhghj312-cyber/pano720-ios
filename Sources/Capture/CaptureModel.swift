@@ -38,6 +38,8 @@ final class CaptureModel {
     private(set) var alignmentDeg: Float = 180
     private(set) var isAligned = false
     private(set) var isSteady = false
+    /// 瞬时角速度是否过快（Street View 的 MovingTooFast / PhotoSkippedTooFast 同款保护）
+    private(set) var isMovingTooFast = false
     private(set) var isAutoCaptureEnabled = true
     private(set) var flashTick = 0
     private(set) var lastThumbnail: UIImage?
@@ -54,6 +56,9 @@ final class CaptureModel {
 
     private var history: [(TimeInterval, Vec3)] = []
     private var lastShotTime: TimeInterval = 0
+    private var lastMotionTime: TimeInterval = 0
+    private var lastMotionForward = Vec3(0, 1, 0)
+    private var angularSpeed: Float = 0
     private var sessionDir: URL?
     private let haptic = UIImpactFeedbackGenerator(style: .rigid)
 
@@ -107,6 +112,7 @@ final class CaptureModel {
         case .ready:
             if isSwitchingLens { return "正在切换镜头…" }
             if targetNode == nil { return "全部拍完，点「拼接」生成全景" }
+            if isMovingTooFast { return "转得太快了，放慢速度" }
             if !isSteady { return "端稳手机，慢慢移动" }
             if isAligned { return "保持不动，正在自动拍摄" }
             let yaw = targetOffsetYaw
@@ -214,6 +220,20 @@ final class CaptureModel {
         currentRotation = sample.rotation
         currentForward = sample.forward
 
+        // 瞬时角速度。Street View 的 LightCycleNative 暴露了 MovingTooFast /
+        // PhotoSkippedTooFast：转动过快时曝光期间画面会糊，糊帧混进重叠区
+        // 比少一帧更糟。低通滤波避免单帧陀螺噪声误判。
+        if lastMotionTime > 0 {
+            let dt = sample.timestamp - lastMotionTime
+            if dt > 0.005, dt < 0.5 {
+                let deg = rad2deg(angleBetween(lastMotionForward, sample.forward))
+                angularSpeed = angularSpeed * 0.7 + (deg / Float(dt)) * 0.3
+                isMovingTooFast = angularSpeed > 70      // 度/秒
+            }
+        }
+        lastMotionTime = sample.timestamp
+        lastMotionForward = sample.forward
+
         if nodes.isEmpty, !isSwitchingLens {
             rebuildGrid(forward: sample.forward)
         }
@@ -287,6 +307,12 @@ final class CaptureModel {
 
     private func triggerCapture(nodeID: Int?) {
         guard case .ready = phase, !isSwitchingLens else { return }
+        // 快速甩动时跳过这一张：运动模糊帧一旦进入重叠区，特征匹配和融合都会被带偏。
+        // 自动模式本来就有 isSteady 拦截，这里主要保护手动快门。
+        if isMovingTooFast {
+            showNotice("转动太快，这一张已跳过 · 放慢速度")
+            return
+        }
         guard let frame = camera.grabFrame() else { return }
 
         phase = .capturing

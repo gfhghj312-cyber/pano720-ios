@@ -188,17 +188,72 @@ Metal / OpenCV / 光度配准共用同一个 `rotation`，无需各自处理方�
 物理摆正版与 Q 吸收版均 8/8 选中正确项，重建 PSNR 全部回到 27.58 dB；
 正确分数 7.97、错误 54~65。仿真中单纯把源帧上下颠倒会让 PSNR 从 29.2 掉到 12.0。
 
+## 从 Google Street View APK 移植了什么
+
+工作目录里的 `ggjj_923827.apk`（44 MB，`com.google.android.street`）。
+**结论先说：全景拍摄部分没法「直接」搬进 iOS。** 这不是移植工作量的问题，是二进制格式与运行时不兼容：
+
+| 组件 | 实际内容 | iOS 可用 |
+| --- | --- | --- |
+| `liblightcycle.so` (3.46 MB) | ELF64 / AArch64（`7f454c46`，machine `0xB7`），依赖 `libEGL.so`、`libGLESv2.so`、`libandroid.so`、`libjnigraphics.so`，导出 `Java_com_google_android_apps_lightcycle_panorama_*` JNI | 否 |
+| `classes*.dex` (13.7 MB) | Dalvik 字节码（头 `dex\n035\0`） | 否 |
+| `libphotosphere_utils.so` | ELF + Adobe XMP Toolkit 5.5.0 | 否 |
+| GPano XMP 元数据规范 | 公开的数据格式，与平台无关 | **是** |
+
+Google 没有发布 LightCycle 的 iOS 版，也没有开源实现。`.so` 里那 44 个 `.cc` 路径只是调试符号，不含源码。
+
+### 从符号里还原出的引擎结构
+
+| 层 | 模块 | 作用 |
+| --- | --- | --- |
+| capture | `target_generator` / `target_manager` / `gyro_calibrator` / `fov_calibrator` | 球面目标点引导、陀螺与 FOV 标定 |
+| alignment | `spherical_pairwise_match` / `patch_pairwise_matcher` / `line_align` | 成对姿态估计（含直线约束） |
+| optical_flow | `camera_rotation_model` / `flow_constraints` / `global_flow_solver` | 全局光流精配准 |
+| rendering | `seam_finder_graphcut` / `seam_selection` / `image_masker` / `blender` | **Graph Cut 最优接缝 + 多频段融合** |
+| session | `metadata_utils` / `photosphere_parameters` | GPano XMP 读写 |
+
+关键发现：Google 的 rendering 层**不做重叠帧加权混合**，而是逐像素选一帧（mask），
+再把多频段金字塔只用于消除接缝两侧的曝光差。
+
+### 实际移植的部分（平台无关）
+
+1. **GPano XMP 输出** — `Stitch/PhotoSphereMetadata.swift`。
+   字段与 `libphotosphere_utils.so` 里的 `geo_photo_service.PanoramaParameters` 逐个核对：
+   `FullPano*Pixels`、`CroppedArea*Pixels`、`Pose*Degrees`、`InitialView*Degrees`，
+   命名空间 `http://ns.google.com/photos/1.0/panorama/`。写进 JPEG APP1 段后，
+   系统「照片」/ Google Photos 会把成片识别成可拖动的 360° 全景（这正是之前 README
+   「已知限制」里列的那一条缺口）。`Tools/verify_xmp.py` 验证段结构、14 个字段和解码。
+2. **FOV 连续标定** — `OrientationProbe` 的焦距扫描从 7 档粗选升级为
+   「粗扫 + 三点抛物线插值」，对应 `fov_calibrator.cc` 用 Ceres 做连续优化的思路。
+3. **转动过快跳过拍摄** — `CaptureModel.isMovingTooFast`（>70°/s，低通滤波），
+   对应 `LightCycleNative_MovingTooFast` / `PhotoSkippedTooFast`；
+   避免运动模糊帧混进重叠区把特征匹配和融合一起带偏。
+4. 我们已有的球面机位引导，对应它的 `target_generator` / `target_manager`。
+
+### 试过但没采用：最优接缝
+
+按 rendering 层的思路把高频层改成「每像素只取一帧」，结果与预期相反：
+
+- 单层看线更锐利，但套上两频段合成后接缝跳变处出现**白色亮斑/断裂**；
+- 权重锐化折中（wt^p，p=2…32）各项指标单调变差：PSNR 17.58→17.06，
+  P99 误差 174→180，高频能量 0.0474→0.0541（真值 0.0448）。
+
+原因：`seam_finder_graphcut.cc` 用 max-flow 把接缝选在图像差异最小处
+（代价含 LaplacianCbCr 差与曝光差），「离画幅中心最近」的 Voronoi 硬切没有这个性质。
+在补齐 max-flow 之前保留已验证的窄羽化两频段混合更稳妥。
+完整数据见 `Tools/verify_seam.py`。
+
 ## 已知限制
 
-- 精配准解的是「旋转」，不建稀疏点云、不做完整 bundle adjustment，也不处理视差（机位平移）。
+- 精配准解的是「旋转」，不做完整 bundle adjustment，也没有 Google 那套全局光流精配准 / Graph Cut 接缝。
   所以贴得很近的物体（30cm 内的桌角）在重叠区仍可能错开 —— 转手机的时候尽量原地转，别走位。
 - 结果页会显示「对齐残差」和「朝向校准」。残差正常 0.2~0.5°；
   朝向校准的置信低于 2× 时，说明场景纹理不足，建议换光线好、有细节的环境重拍。
 - 运动物体（行人、车）在重叠区会出现重影，这是所有曝光式全景的共性。
 - 融合是「宽羽化低频 + 窄羽化高频」两频段，不是完整的多频段金字塔；
   极端的逆光/高反差接缝仍可能有轻微色差。
-- 输出是标准等距圆柱 JPEG，但没写 GPano XMP 元数据，所以系统「照片」不会自动识别为全景球。
-  App 内有自己的查看器，可以拖动/缩放无缝浏览。
+- 输出带 GPano XMP，系统「照片」/ Google Photos 会识别为 360° 全景球；
+  App 内也自带拖动/缩放查看器。
 
 ## 目录结构
 

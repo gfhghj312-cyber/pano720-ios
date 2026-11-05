@@ -141,16 +141,36 @@ enum OrientationProbe {
         }()
         if bestScore < 0 { return nil }
 
-        // 2) 在选中的朝向上粗扫焦距比例。videoFieldOfView 报偏 10% 就会让
-        //    接缝从中心往外散开，这是纯几何手段能测到的另一半标定误差。
+        // 2) 在选中的朝向上标定焦距比例（对应 Street View 的 fov_calibrator.cc）。
+        //    videoFieldOfView 报偏 10% 就会让接缝从中心往外散开，这是纯几何能测到的
+        //    另一半标定误差。先粗扫，再用最优档左右三点做抛物线插值精化。
         let scales: [Float] = [0.82, 0.88, 0.94, 1.0, 1.07, 1.15, 1.24]
+        var samples: [(k: Float, s: Float)] = []
+        for k in scales { samples.append((k, score(bestAxis.matrix, k))) }
+
         var bestScale: Float = 1
         var bestFocalScore = bestScore
-        for k in scales where k != 1 {
-            let s = score(bestAxis.matrix, k)
-            if s >= 0 && s < bestFocalScore * 0.97 {
-                bestFocalScore = s
-                bestScale = k
+        if samples.allSatisfy({ $0.s >= 0 }) {
+            let idx = samples.indices.min(by: { samples[$0].s < samples[$1].s }) ?? 3
+            if samples[idx].s < bestScore * 0.97 {
+                bestFocalScore = samples[idx].s
+                bestScale = samples[idx].k
+                // 三点抛物线顶点，把离散档位细化成连续估计
+                if idx > 0, idx < samples.count - 1 {
+                    let a = samples[idx - 1].s
+                    let b = samples[idx].s
+                    let c = samples[idx + 1].s
+                    let denom = a - 2 * b + c
+                    if abs(denom) > 1e-6 {
+                        let delta = 0.5 * (a - c) / denom
+                        let step = samples[idx + 1].k - samples[idx].k
+                        let refined = samples[idx].k + max(-1, min(1, delta)) * step
+                        bestScale = max(samples[idx - 1].k, min(samples[idx + 1].k, refined))
+                        let rs = score(bestAxis.matrix, bestScale)
+                        if rs >= 0, rs < bestFocalScore { bestFocalScore = rs }
+                        else { bestScale = samples[idx].k }
+                    }
+                }
             }
         }
 
